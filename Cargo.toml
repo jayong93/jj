@@ -49,15 +49,10 @@ dunce = "1.0.5"
 either = "1.13.0"
 esl01-renderdag = "0.3.0"
 futures = "0.3.30"
-git2 = { version = "0.18.3", features = [
-    # Do *not* disable this feature even if you'd like dynamic linking. Instead,
-    # set the environment variable `LIBGIT2_NO_VENDOR=1` if dynamic linking must
-    # be used (this will override the Cargo feature), and allow static linking
-    # in other cases. Rationale: If neither the feature nor the environment
-    # variable are set, `git2` may still decide to vendor `libgit2` if it
-    # doesn't find a version of `libgit2` to link to dynamically. See also
-    # https://github.com/rust-lang/git2-rs/commit/3cef4119f
-    "vendored-libgit2"
+git2 = { git = "https://github.com/jayong93/git2-rs.git", rev = "7e09cbb023c4154421514554e00ab7df373b4c10", default-features = false, features = [
+    "https",
+    "ssh-openssh",
+    "vendored-libgit2",
 ] }
 gix = { version = "0.64.0", default-features = false, features = [
     "index",
