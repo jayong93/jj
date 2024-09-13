@@ -24,17 +24,25 @@ use jj_lib::conflicts::extract_as_single_hunk;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::Matcher;
 use jj_lib::merged_tree::MergedTree;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf};
-use jj_lib::settings::{ConfigResultExt as _, UserSettings};
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::settings::ConfigResultExt as _;
+use jj_lib::settings::UserSettings;
 use jj_lib::working_copy::SnapshotError;
 use pollster::FutureExt;
 use thiserror::Error;
 
-use self::builtin::{edit_diff_builtin, edit_merge_builtin, BuiltinToolError};
+use self::builtin::edit_diff_builtin;
+use self::builtin::edit_merge_builtin;
+use self::builtin::BuiltinToolError;
 pub(crate) use self::diff_working_copies::new_utf8_temp_dir;
 use self::diff_working_copies::DiffCheckoutError;
-use self::external::{edit_diff_external, ExternalToolError};
-pub use self::external::{generate_diff, invoke_external_diff, DiffToolMode, ExternalMergeTool};
+use self::external::edit_diff_external;
+pub use self::external::generate_diff;
+pub use self::external::invoke_external_diff;
+pub use self::external::DiffToolMode;
+pub use self::external::ExternalMergeTool;
+use self::external::ExternalToolError;
 use crate::config::CommandNameAndArgs;
 use crate::ui::Ui;
 
@@ -288,14 +296,8 @@ impl MergeEditor {
             Ok(None) => return Err(ConflictResolveError::PathNotFound(repo_path.to_owned())),
         };
         let file_merge = conflict.to_file_merge().ok_or_else(|| {
-            let mut summary_bytes: Vec<u8> = vec![];
-            conflict
-                .describe(&mut summary_bytes)
-                .expect("Writing to an in-memory buffer should never fail");
-            ConflictResolveError::NotNormalFiles(
-                repo_path.to_owned(),
-                String::from_utf8_lossy(summary_bytes.as_slice()).to_string(),
-            )
+            let summary = conflict.describe();
+            ConflictResolveError::NotNormalFiles(repo_path.to_owned(), summary)
         })?;
         let simplified_file_merge = file_merge.clone().simplify();
         // We only support conflicts with 2 sides (3-way conflicts)

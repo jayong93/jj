@@ -14,113 +14,156 @@
 
 #![allow(missing_docs)]
 
+use std::borrow::Borrow;
 use std::collections::VecDeque;
-use std::fmt::{Debug, Error, Formatter};
+use std::iter;
+use std::mem;
 
-use crate::diff;
-use crate::diff::{Diff, DiffHunk};
-use crate::merge::{trivial_merge, Merge};
+use bstr::BStr;
+use bstr::BString;
 
+use crate::diff::Diff;
+use crate::diff::DiffHunk;
+use crate::merge::trivial_merge;
+use crate::merge::Merge;
+
+/// A diff line which may contain small hunks originating from both sides.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct DiffLine<'a> {
-    pub left_line_number: u32,
-    pub right_line_number: u32,
-    pub has_left_content: bool,
-    pub has_right_content: bool,
-    pub hunks: Vec<DiffHunk<'a>>,
+    pub line_number: DiffLineNumber,
+    pub hunks: Vec<(DiffLineHunkSide, &'a BStr)>,
 }
 
 impl DiffLine<'_> {
-    fn reset_line(&mut self) {
-        self.has_left_content = false;
-        self.has_right_content = false;
-        self.hunks.clear();
+    pub fn has_left_content(&self) -> bool {
+        self.hunks
+            .iter()
+            .any(|&(side, _)| side != DiffLineHunkSide::Right)
+    }
+
+    pub fn has_right_content(&self) -> bool {
+        self.hunks
+            .iter()
+            .any(|&(side, _)| side != DiffLineHunkSide::Left)
     }
 
     pub fn is_unmodified(&self) -> bool {
         self.hunks
             .iter()
-            .all(|hunk| matches!(hunk, DiffHunk::Matching(_)))
+            .all(|&(side, _)| side == DiffLineHunkSide::Both)
+    }
+
+    fn take(&mut self) -> Self {
+        DiffLine {
+            line_number: self.line_number,
+            hunks: mem::take(&mut self.hunks),
+        }
     }
 }
 
-pub fn diff<'a>(left: &'a [u8], right: &'a [u8]) -> DiffLineIterator<'a> {
-    let diff_hunks = diff::diff(left, right);
-    DiffLineIterator::new(diff_hunks)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiffLineNumber {
+    pub left: u32,
+    pub right: u32,
 }
 
-pub struct DiffLineIterator<'a> {
-    diff_hunks: Vec<DiffHunk<'a>>,
-    current_pos: usize,
+/// Which side a `DiffLine` hunk belongs to?
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffLineHunkSide {
+    Both,
+    Left,
+    Right,
+}
+
+pub struct DiffLineIterator<'a, I> {
+    diff_hunks: iter::Fuse<I>,
     current_line: DiffLine<'a>,
     queued_lines: VecDeque<DiffLine<'a>>,
 }
 
-impl<'a> DiffLineIterator<'a> {
-    fn new(diff_hunks: Vec<DiffHunk<'a>>) -> Self {
+impl<'a, I> DiffLineIterator<'a, I>
+where
+    I: Iterator,
+    I::Item: Borrow<DiffHunk<'a>>,
+{
+    /// Iterates `diff_hunks` by line. Each hunk should have exactly two inputs.
+    pub fn new(diff_hunks: I) -> Self {
+        let line_number = DiffLineNumber { left: 1, right: 1 };
+        Self::with_line_number(diff_hunks, line_number)
+    }
+
+    /// Iterates `diff_hunks` by line. Each hunk should have exactly two inputs.
+    /// Hunk's line numbers start from the given `line_number`.
+    pub fn with_line_number(diff_hunks: I, line_number: DiffLineNumber) -> Self {
         let current_line = DiffLine {
-            left_line_number: 1,
-            right_line_number: 1,
-            has_left_content: false,
-            has_right_content: false,
+            line_number,
             hunks: vec![],
         };
         DiffLineIterator {
-            diff_hunks,
-            current_pos: 0,
+            diff_hunks: diff_hunks.fuse(),
             current_line,
             queued_lines: VecDeque::new(),
         }
     }
 }
 
-impl<'a> Iterator for DiffLineIterator<'a> {
+impl<'a, I> DiffLineIterator<'a, I> {
+    /// Returns line number of the next hunk. After all hunks are consumed, this
+    /// returns the next line number if the last hunk ends with newline.
+    pub fn next_line_number(&self) -> DiffLineNumber {
+        let next_line = self.queued_lines.front().unwrap_or(&self.current_line);
+        next_line.line_number
+    }
+}
+
+impl<'a, I> Iterator for DiffLineIterator<'a, I>
+where
+    I: Iterator,
+    I::Item: Borrow<DiffHunk<'a>>,
+{
     type Item = DiffLine<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // TODO: Should we attempt to interpret as utf-8 and otherwise break only at
         // newlines?
-        while self.current_pos < self.diff_hunks.len() && self.queued_lines.is_empty() {
-            let hunk = &self.diff_hunks[self.current_pos];
-            self.current_pos += 1;
-            match hunk {
-                diff::DiffHunk::Matching(text) => {
-                    let lines = text.split_inclusive(|b| *b == b'\n');
+        while self.queued_lines.is_empty() {
+            let Some(hunk) = self.diff_hunks.next() else {
+                break;
+            };
+            match hunk.borrow() {
+                DiffHunk::Matching(text) => {
+                    let lines = text.split_inclusive(|b| *b == b'\n').map(BStr::new);
                     for line in lines {
-                        self.current_line.has_left_content = true;
-                        self.current_line.has_right_content = true;
-                        self.current_line.hunks.push(DiffHunk::matching(line));
+                        self.current_line.hunks.push((DiffLineHunkSide::Both, line));
                         if line.ends_with(b"\n") {
-                            self.queued_lines.push_back(self.current_line.clone());
-                            self.current_line.left_line_number += 1;
-                            self.current_line.right_line_number += 1;
-                            self.current_line.reset_line();
+                            self.queued_lines.push_back(self.current_line.take());
+                            self.current_line.line_number.left += 1;
+                            self.current_line.line_number.right += 1;
                         }
                     }
                 }
-                diff::DiffHunk::Different(contents) => {
-                    let left_lines = contents[0].split_inclusive(|b| *b == b'\n');
+                DiffHunk::Different(contents) => {
+                    let [left_text, right_text] = contents[..]
+                        .try_into()
+                        .expect("hunk should have exactly two inputs");
+                    let left_lines = left_text.split_inclusive(|b| *b == b'\n').map(BStr::new);
                     for left_line in left_lines {
-                        self.current_line.has_left_content = true;
                         self.current_line
                             .hunks
-                            .push(DiffHunk::different([left_line, b""]));
+                            .push((DiffLineHunkSide::Left, left_line));
                         if left_line.ends_with(b"\n") {
-                            self.queued_lines.push_back(self.current_line.clone());
-                            self.current_line.left_line_number += 1;
-                            self.current_line.reset_line();
+                            self.queued_lines.push_back(self.current_line.take());
+                            self.current_line.line_number.left += 1;
                         }
                     }
-                    let right_lines = contents[1].split_inclusive(|b| *b == b'\n');
+                    let right_lines = right_text.split_inclusive(|b| *b == b'\n').map(BStr::new);
                     for right_line in right_lines {
-                        self.current_line.has_right_content = true;
                         self.current_line
                             .hunks
-                            .push(DiffHunk::different([b"", right_line]));
+                            .push((DiffLineHunkSide::Right, right_line));
                         if right_line.ends_with(b"\n") {
-                            self.queued_lines.push_back(self.current_line.clone());
-                            self.current_line.right_line_number += 1;
-                            self.current_line.reset_line();
+                            self.queued_lines.push_back(self.current_line.take());
+                            self.current_line.line_number.right += 1;
                         }
                     }
                 }
@@ -132,35 +175,17 @@ impl<'a> Iterator for DiffLineIterator<'a> {
         }
 
         if !self.current_line.hunks.is_empty() {
-            let line = self.current_line.clone();
-            self.current_line.reset_line();
-            return Some(line);
+            return Some(self.current_line.take());
         }
 
         None
     }
 }
 
-// TODO: Maybe ContentHunk can be replaced with BString?
-#[derive(PartialEq, Eq, Clone)]
-pub struct ContentHunk(pub Vec<u8>);
-
-impl AsRef<[u8]> for ContentHunk {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl Debug for ContentHunk {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        String::from_utf8_lossy(&self.0).fmt(f)
-    }
-}
-
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum MergeResult {
-    Resolved(ContentHunk),
-    Conflict(Vec<Merge<ContentHunk>>),
+    Resolved(BString),
+    Conflict(Vec<Merge<BString>>),
 }
 
 pub fn merge<T: AsRef<[u8]>>(slices: &Merge<T>) -> MergeResult {
@@ -173,28 +198,24 @@ pub fn merge<T: AsRef<[u8]>>(slices: &Merge<T>) -> MergeResult {
 }
 
 fn merge_hunks(diff: &Diff, num_diffs: usize) -> MergeResult {
-    let mut resolved_hunk = ContentHunk(vec![]);
-    let mut merge_hunks: Vec<Merge<ContentHunk>> = vec![];
+    let mut resolved_hunk = BString::new(vec![]);
+    let mut merge_hunks: Vec<Merge<BString>> = vec![];
     for diff_hunk in diff.hunks() {
         match diff_hunk {
             DiffHunk::Matching(content) => {
-                resolved_hunk.0.extend_from_slice(content);
+                resolved_hunk.extend_from_slice(content);
             }
             DiffHunk::Different(parts) => {
                 if let Some(resolved) = trivial_merge(&parts[..num_diffs], &parts[num_diffs..]) {
-                    resolved_hunk.0.extend_from_slice(resolved);
+                    resolved_hunk.extend_from_slice(resolved);
                 } else {
-                    if !resolved_hunk.0.is_empty() {
+                    if !resolved_hunk.is_empty() {
                         merge_hunks.push(Merge::resolved(resolved_hunk));
-                        resolved_hunk = ContentHunk(vec![]);
+                        resolved_hunk = BString::new(vec![]);
                     }
                     merge_hunks.push(Merge::from_removes_adds(
-                        parts[..num_diffs]
-                            .iter()
-                            .map(|part| ContentHunk(part.to_vec())),
-                        parts[num_diffs..]
-                            .iter()
-                            .map(|part| ContentHunk(part.to_vec())),
+                        parts[..num_diffs].iter().copied().map(BString::from),
+                        parts[num_diffs..].iter().copied().map(BString::from),
                     ));
                 }
             }
@@ -204,7 +225,7 @@ fn merge_hunks(diff: &Diff, num_diffs: usize) -> MergeResult {
     if merge_hunks.is_empty() {
         MergeResult::Resolved(resolved_hunk)
     } else {
-        if !resolved_hunk.0.is_empty() {
+        if !resolved_hunk.is_empty() {
             merge_hunks.push(Merge::resolved(resolved_hunk));
         }
         MergeResult::Conflict(merge_hunks)
@@ -215,12 +236,69 @@ fn merge_hunks(diff: &Diff, num_diffs: usize) -> MergeResult {
 mod tests {
     use super::*;
 
-    fn hunk(data: &[u8]) -> ContentHunk {
-        ContentHunk(data.to_vec())
+    fn hunk(data: &[u8]) -> BString {
+        data.into()
     }
 
     fn merge(removes: &[&[u8]], adds: &[&[u8]]) -> MergeResult {
         super::merge(&Merge::from_removes_adds(removes, adds))
+    }
+
+    #[test]
+    fn test_diff_line_iterator_line_numbers() {
+        let mut line_iter = DiffLineIterator::with_line_number(
+            [DiffHunk::different(["a\nb", "c\nd\n"])].into_iter(),
+            DiffLineNumber { left: 1, right: 10 },
+        );
+        // Nothing queued
+        assert_eq!(
+            line_iter.next_line_number(),
+            DiffLineNumber { left: 1, right: 10 }
+        );
+        assert_eq!(
+            line_iter.next().unwrap(),
+            DiffLine {
+                line_number: DiffLineNumber { left: 1, right: 10 },
+                hunks: vec![(DiffLineHunkSide::Left, "a\n".as_ref())],
+            }
+        );
+        // Multiple lines queued
+        assert_eq!(
+            line_iter.next_line_number(),
+            DiffLineNumber { left: 2, right: 10 }
+        );
+        assert_eq!(
+            line_iter.next().unwrap(),
+            DiffLine {
+                line_number: DiffLineNumber { left: 2, right: 10 },
+                hunks: vec![
+                    (DiffLineHunkSide::Left, "b".as_ref()),
+                    (DiffLineHunkSide::Right, "c\n".as_ref()),
+                ],
+            }
+        );
+        // Single line queued
+        assert_eq!(
+            line_iter.next_line_number(),
+            DiffLineNumber { left: 2, right: 11 }
+        );
+        assert_eq!(
+            line_iter.next().unwrap(),
+            DiffLine {
+                line_number: DiffLineNumber { left: 2, right: 11 },
+                hunks: vec![(DiffLineHunkSide::Right, "d\n".as_ref())],
+            }
+        );
+        // No more lines: left remains 2 as it lacks newline
+        assert_eq!(
+            line_iter.next_line_number(),
+            DiffLineNumber { left: 2, right: 12 }
+        );
+        assert!(line_iter.next().is_none());
+        assert_eq!(
+            line_iter.next_line_number(),
+            DiffLineNumber { left: 2, right: 12 }
+        );
     }
 
     #[test]

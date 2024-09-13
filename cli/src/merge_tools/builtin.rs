@@ -2,17 +2,31 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
-use futures::{StreamExt, TryFutureExt, TryStreamExt};
+use bstr::BString;
+use futures::StreamExt;
+use futures::TryFutureExt;
+use futures::TryStreamExt;
 use itertools::Itertools;
-use jj_lib::backend::{BackendError, BackendResult, FileId, MergedTreeId, TreeValue};
-use jj_lib::conflicts::{materialize_tree_value, MaterializedTreeValue};
-use jj_lib::diff::{Diff, DiffHunk};
-use jj_lib::files::{self, ContentHunk, MergeResult};
+use jj_lib::backend::BackendError;
+use jj_lib::backend::BackendResult;
+use jj_lib::backend::FileId;
+use jj_lib::backend::MergedTreeId;
+use jj_lib::backend::TreeValue;
+use jj_lib::conflicts::materialize_merge_result;
+use jj_lib::conflicts::materialize_tree_value;
+use jj_lib::conflicts::MaterializedTreeValue;
+use jj_lib::diff::Diff;
+use jj_lib::diff::DiffHunk;
+use jj_lib::files;
+use jj_lib::files::MergeResult;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::Merge;
-use jj_lib::merged_tree::{MergedTree, MergedTreeBuilder};
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree::MergedTreeBuilder;
+use jj_lib::merged_tree::TreeDiffEntry;
 use jj_lib::object_id::ObjectId;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf};
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::store::Store;
 use pollster::FutureExt;
 use thiserror::Error;
@@ -192,13 +206,24 @@ fn read_file_contents(
             item: "git submodule",
             id: id.hex(),
         }),
-        MaterializedTreeValue::Conflict {
+        MaterializedTreeValue::FileConflict {
             id: _,
             contents,
             executable: _,
         } => {
+            let mut buf = Vec::new();
+            materialize_merge_result(&contents, &mut buf)
+                .expect("Failed to materialize conflict to in-memory buffer");
             // TODO: Render the ID somehow?
-            let contents = buf_to_file_contents(None, contents);
+            let contents = buf_to_file_contents(None, buf);
+            Ok(FileInfo {
+                file_mode: scm_record::FileMode(mode::NORMAL),
+                contents,
+            })
+        }
+        MaterializedTreeValue::OtherConflict { id } => {
+            // TODO: Render the ID somehow?
+            let contents = buf_to_file_contents(None, id.describe().into_bytes());
             Ok(FileInfo {
                 file_mode: scm_record::FileMode(mode::NORMAL),
                 contents,
@@ -494,9 +519,10 @@ pub fn edit_diff_builtin(
     matcher: &dyn Matcher,
 ) -> Result<MergedTreeId, BuiltinToolError> {
     let store = left_tree.store().clone();
+    // TODO: handle copy tracking
     let changed_files: Vec<_> = left_tree
         .diff_stream(right_tree, matcher)
-        .map(|(path, diff)| diff.map(|_| path))
+        .map(|TreeDiffEntry { path, values }| values.map(|_| path))
         .try_collect()
         .block_on()?;
     let files = make_diff_files(&store, left_tree, right_tree, &changed_files)?;
@@ -520,8 +546,8 @@ fn make_merge_sections(
 ) -> Result<Vec<scm_record::Section<'static>>, BuiltinToolError> {
     let mut sections = Vec::new();
     match merge_result {
-        MergeResult::Resolved(ContentHunk(buf)) => {
-            let contents = buf_to_file_contents(None, buf);
+        MergeResult::Resolved(buf) => {
+            let contents = buf_to_file_contents(None, buf.into());
             let section = match contents {
                 FileContents::Absent => None,
                 FileContents::Text {
@@ -547,7 +573,7 @@ fn make_merge_sections(
         MergeResult::Conflict(hunks) => {
             for hunk in hunks {
                 let section = match hunk.into_resolved() {
-                    Ok(ContentHunk(contents)) => {
+                    Ok(contents) => {
                         let contents = std::str::from_utf8(&contents).map_err(|err| {
                             BuiltinToolError::DecodeUtf8 {
                                 source: err,
@@ -573,7 +599,6 @@ fn make_merge_sections(
                                 .cycle(),
                             )
                             .map(|(contents, change_type)| -> Result<_, BuiltinToolError> {
-                                let ContentHunk(contents) = contents;
                                 let contents = std::str::from_utf8(contents).map_err(|err| {
                                     BuiltinToolError::DecodeUtf8 {
                                         source: err,
@@ -599,7 +624,7 @@ fn make_merge_sections(
 pub fn edit_merge_builtin(
     tree: &MergedTree,
     path: &RepoPath,
-    content: Merge<ContentHunk>,
+    content: Merge<BString>,
 ) -> Result<MergedTreeId, BuiltinToolError> {
     let merge_result = files::merge(&content);
     let sections = make_merge_sections(merge_result)?;

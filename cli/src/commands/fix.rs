@@ -12,29 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::mpsc::channel;
 
 use futures::StreamExt;
 use itertools::Itertools;
-use jj_lib::backend::{BackendError, CommitId, FileId, TreeValue};
-use jj_lib::fileset::{self, FilesetExpression};
-use jj_lib::matchers::{EverythingMatcher, Matcher};
+use jj_lib::backend::BackendError;
+use jj_lib::backend::CommitId;
+use jj_lib::backend::FileId;
+use jj_lib::backend::TreeValue;
+use jj_lib::fileset;
+use jj_lib::fileset::FilesetExpression;
+use jj_lib::matchers::EverythingMatcher;
+use jj_lib::matchers::Matcher;
 use jj_lib::merged_tree::MergedTreeBuilder;
+use jj_lib::merged_tree::TreeDiffEntry;
 use jj_lib::repo::Repo;
-use jj_lib::repo_path::{RepoPathBuf, RepoPathUiConverter};
-use jj_lib::revset::{RevsetExpression, RevsetIteratorExt};
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::repo_path::RepoPathUiConverter;
+use jj_lib::revset::RevsetExpression;
+use jj_lib::revset::RevsetIteratorExt;
 use jj_lib::store::Store;
 use pollster::FutureExt;
 use rayon::iter::IntoParallelIterator;
 use rayon::prelude::ParallelIterator;
 use tracing::instrument;
 
-use crate::cli_util::{CommandHelper, RevisionArg};
-use crate::command_error::{config_error, CommandError};
-use crate::config::{to_toml_value, CommandNameAndArgs};
+use crate::cli_util::CommandHelper;
+use crate::cli_util::RevisionArg;
+use crate::command_error::config_error;
+use crate::command_error::CommandError;
+use crate::config::to_toml_value;
+use crate::config::CommandNameAndArgs;
 use crate::ui::Ui;
 
 /// Update files with formatting fixes or other changes
@@ -71,8 +83,9 @@ use crate::ui::Ui;
 ///
 /// For example, the following configuration defines how two code formatters
 /// (`clang-format` and `black`) will apply to three different file extensions
-/// (.cc, .h, and .py):
+/// (`.cc`, `.h`, and `.py`):
 ///
+/// ```toml
 /// [fix.tools.clang-format]
 /// command = ["/usr/bin/clang-format", "--assume-filename=$path"]
 /// patterns = ["glob:'**/*.cc'",
@@ -81,6 +94,7 @@ use crate::ui::Ui;
 /// [fix.tools.black]
 /// command = ["/usr/bin/black", "-", "--stdin-filename=$path"]
 /// patterns = ["glob:'**/*.py'"]
+/// ```
 ///
 /// Execution order of tools that affect the same file is deterministic, but
 /// currently unspecified, and may change between releases. If two tools affect
@@ -92,8 +106,10 @@ use crate::ui::Ui;
 /// example, the following configuration would apply the Rust formatter to all
 /// changed files (whether they are Rust files or not):
 ///
+/// ```toml
 /// [fix]
 /// tool-command = ["rustfmt", "--emit", "stdout"]
+/// ```
 ///
 /// The tool defined by `tool-command` acts as if it was the first entry in
 /// `fix.tools`, and uses `pattern = "all()"``. Support for `tool-command`
@@ -172,10 +188,15 @@ pub(crate) fn cmd_fix(
         // Also fix any new paths that were changed in this commit.
         let tree = commit.tree()?;
         let parent_tree = commit.parent_tree(tx.repo())?;
+        // TODO: handle copy tracking
         let mut diff_stream = parent_tree.diff_stream(&tree, &matcher);
         async {
-            while let Some((repo_path, diff)) = diff_stream.next().await {
-                let (_before, after) = diff?;
+            while let Some(TreeDiffEntry {
+                path: repo_path,
+                values,
+            }) = diff_stream.next().await
+            {
+                let (_before, after) = values?;
                 // Deleted files have no file content to fix, and they have no terms in `after`,
                 // so we don't add any tool inputs for them. Conflicted files produce one tool
                 // input for each side of the conflict.

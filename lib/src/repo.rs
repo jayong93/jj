@@ -15,11 +15,15 @@
 #![allow(missing_docs)]
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::slice;
 use std::sync::Arc;
-use std::{fs, slice};
 
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
@@ -27,37 +31,69 @@ use thiserror::Error;
 use tracing::instrument;
 
 use self::dirty_cell::DirtyCell;
-use crate::backend::{
-    Backend, BackendError, BackendInitError, BackendLoadError, BackendResult, ChangeId, CommitId,
-    MergedTreeId,
-};
-use crate::commit::{Commit, CommitByCommitterTimestamp};
-use crate::commit_builder::{CommitBuilder, DetachedCommitBuilder};
-use crate::default_index::{DefaultIndexStore, DefaultMutableIndex};
+use crate::backend::Backend;
+use crate::backend::BackendError;
+use crate::backend::BackendInitError;
+use crate::backend::BackendLoadError;
+use crate::backend::BackendResult;
+use crate::backend::ChangeId;
+use crate::backend::CommitId;
+use crate::backend::MergedTreeId;
+use crate::commit::Commit;
+use crate::commit::CommitByCommitterTimestamp;
+use crate::commit_builder::CommitBuilder;
+use crate::commit_builder::DetachedCommitBuilder;
+use crate::dag_walk;
+use crate::default_index::DefaultIndexStore;
+use crate::default_index::DefaultMutableIndex;
 use crate::default_submodule_store::DefaultSubmoduleStore;
-use crate::file_util::{IoResultExt as _, PathError};
-use crate::index::{ChangeIdIndex, Index, IndexReadError, IndexStore, MutableIndex, ReadonlyIndex};
+use crate::file_util::IoResultExt as _;
+use crate::file_util::PathError;
+use crate::index::ChangeIdIndex;
+use crate::index::Index;
+use crate::index::IndexReadError;
+use crate::index::IndexStore;
+use crate::index::MutableIndex;
+use crate::index::ReadonlyIndex;
 use crate::local_backend::LocalBackend;
-use crate::object_id::{HexPrefix, ObjectId, PrefixResolution};
-use crate::op_heads_store::{self, OpHeadResolutionError, OpHeadsStore};
-use crate::op_store::{
-    OpStore, OpStoreError, OperationId, RefTarget, RemoteRef, RemoteRefState, WorkspaceId,
-};
+use crate::merge::MergeBuilder;
+use crate::object_id::HexPrefix;
+use crate::object_id::ObjectId;
+use crate::object_id::PrefixResolution;
+use crate::op_heads_store;
+use crate::op_heads_store::OpHeadResolutionError;
+use crate::op_heads_store::OpHeadsStore;
+use crate::op_store;
+use crate::op_store::OpStore;
+use crate::op_store::OpStoreError;
+use crate::op_store::OperationId;
+use crate::op_store::RefTarget;
+use crate::op_store::RemoteRef;
+use crate::op_store::RemoteRefState;
+use crate::op_store::WorkspaceId;
 use crate::operation::Operation;
-use crate::refs::{
-    diff_named_ref_targets, diff_named_remote_refs, merge_ref_targets, merge_remote_refs,
-};
-use crate::revset::{RevsetEvaluationError, RevsetExpression, RevsetIteratorExt};
-use crate::rewrite::{merge_commit_trees, CommitRewriter, DescendantRebaser, RebaseOptions};
-use crate::settings::{RepoSettings, UserSettings};
-use crate::signing::{SignInitError, Signer};
+use crate::refs::diff_named_ref_targets;
+use crate::refs::diff_named_remote_refs;
+use crate::refs::merge_ref_targets;
+use crate::refs::merge_remote_refs;
+use crate::revset;
+use crate::revset::RevsetEvaluationError;
+use crate::revset::RevsetExpression;
+use crate::revset::RevsetIteratorExt;
+use crate::rewrite::merge_commit_trees;
+use crate::rewrite::CommitRewriter;
+use crate::rewrite::DescendantRebaser;
+use crate::rewrite::RebaseOptions;
+use crate::settings::RepoSettings;
+use crate::settings::UserSettings;
+use crate::signing::SignInitError;
+use crate::signing::Signer;
 use crate::simple_op_heads_store::SimpleOpHeadsStore;
 use crate::simple_op_store::SimpleOpStore;
 use crate::store::Store;
 use crate::submodule_store::SubmoduleStore;
 use crate::transaction::Transaction;
 use crate::view::View;
-use crate::{dag_walk, op_store, revset};
 
 pub trait Repo {
     fn store(&self) -> &Arc<Store>;
@@ -155,7 +191,7 @@ impl ReadonlyRepo {
         let backend = backend_initializer(user_settings, &store_path)?;
         let backend_path = store_path.join("type");
         fs::write(&backend_path, backend.name()).context(&backend_path)?;
-        let store = Store::new(backend, signer, user_settings.use_tree_conflict_format());
+        let store = Store::new(backend, signer);
         let repo_settings = user_settings.with_repo(&repo_path).unwrap();
 
         let op_store_path = repo_path.join("op_store");
@@ -632,7 +668,6 @@ impl RepoLoader {
         let store = Store::new(
             store_factories.load_backend(user_settings, &repo_path.join("store"))?,
             Signer::from_settings(user_settings)?,
-            user_settings.use_tree_conflict_format(),
         );
         let repo_settings = user_settings.with_repo(repo_path).unwrap();
         let op_store =
@@ -757,7 +792,7 @@ impl RepoLoader {
         self.merge_operations(
             user_settings,
             op_heads,
-            Some("resolve concurrent operations"),
+            Some("reconcile divergent operations"),
         )
     }
 
@@ -953,64 +988,83 @@ impl MutableRepo {
     /// parents. It does that by considering how previous commits have been
     /// rewritten and abandoned.
     ///
-    /// Panics if `parent_mapping` contains cycles
-    pub fn new_parents(&self, old_ids: Vec<CommitId>) -> Vec<CommitId> {
-        fn single_substitution_round(
-            parent_mapping: &HashMap<CommitId, Rewrite>,
-            ids: Vec<CommitId>,
-        ) -> (Vec<CommitId>, bool) {
-            let mut made_replacements = false;
-            let mut new_ids = vec![];
-            // TODO(ilyagr): (Maybe?) optimize common case of replacements all
-            // being singletons. If CommitId-s were Copy. no allocations would be needed in
-            // that case, but it probably doesn't matter much while they are Vec<u8>-s.
-            for id in ids.into_iter() {
-                match parent_mapping.get(&id) {
-                    None | Some(Rewrite::Divergent(_)) => {
-                        new_ids.push(id);
-                    }
-                    Some(Rewrite::Rewritten(replacement)) => {
-                        made_replacements = true;
-                        new_ids.push(replacement.clone())
-                    }
-                    Some(Rewrite::Abandoned(replacements)) => {
-                        assert!(
-                            // Each commit must have a parent, so a parent can
-                            // not just be mapped to nothing. This assertion
-                            // could be removed if this function is used for
-                            // mapping something other than a commit's parents.
-                            !replacements.is_empty(),
-                            "Found empty value for key {id:?} in the parent mapping",
-                        );
-                        made_replacements = true;
-                        new_ids.extend(replacements.iter().cloned())
-                    }
-                };
-            }
-            (new_ids, made_replacements)
-        }
+    /// If `parent_mapping` contains cycles, this function may either panic or
+    /// drop parents that caused cycles.
+    pub fn new_parents(&self, old_ids: &[CommitId]) -> Vec<CommitId> {
+        self.rewritten_ids_with(old_ids, |rewrite| !matches!(rewrite, Rewrite::Divergent(_)))
+    }
 
-        let mut new_ids = old_ids;
-        // The longest possible non-cycle substitution sequence goes through each key of
-        // parent_mapping once.
-        let mut allowed_iterations = 0..self.parent_mapping.len();
-        loop {
-            let made_replacements;
-            (new_ids, made_replacements) = single_substitution_round(&self.parent_mapping, new_ids);
-            if !made_replacements {
-                break;
+    fn rewritten_ids_with(
+        &self,
+        old_ids: &[CommitId],
+        mut predicate: impl FnMut(&Rewrite) -> bool,
+    ) -> Vec<CommitId> {
+        assert!(!old_ids.is_empty());
+        let mut new_ids = Vec::with_capacity(old_ids.len());
+        let mut to_visit = old_ids.iter().rev().collect_vec();
+        let mut visited = HashSet::new();
+        while let Some(id) = to_visit.pop() {
+            if !visited.insert(id) {
+                continue;
             }
-            allowed_iterations
-                .next()
-                .expect("cycle detected in the parent mapping");
+            match self.parent_mapping.get(id).filter(|&v| predicate(v)) {
+                None => {
+                    new_ids.push(id.clone());
+                }
+                Some(rewrite) => {
+                    let replacements = rewrite.new_parent_ids();
+                    assert!(
+                        // Each commit must have a parent, so a parent can
+                        // not just be mapped to nothing. This assertion
+                        // could be removed if this function is used for
+                        // mapping something other than a commit's parents.
+                        !replacements.is_empty(),
+                        "Found empty value for key {id:?} in the parent mapping",
+                    );
+                    to_visit.extend(replacements.iter().rev());
+                }
+            }
         }
-        match new_ids.as_slice() {
-            // The first two cases are an optimization for the common case of commits with <=2
-            // parents
-            [_singleton] => new_ids,
-            [a, b] if a != b => new_ids,
-            _ => new_ids.into_iter().unique().collect(),
+        assert!(
+            !new_ids.is_empty(),
+            "new ids become empty because of cycle in the parent mapping"
+        );
+        debug_assert!(new_ids.iter().all_unique());
+        new_ids
+    }
+
+    /// Fully resolves transitive replacements in `parent_mapping`.
+    ///
+    /// If `parent_mapping` contains cycles, this function will panic.
+    fn resolve_rewrite_mapping_with(
+        &self,
+        mut predicate: impl FnMut(&Rewrite) -> bool,
+    ) -> HashMap<CommitId, Vec<CommitId>> {
+        let sorted_ids = dag_walk::topo_order_forward(
+            self.parent_mapping.keys(),
+            |&id| id,
+            |&id| match self.parent_mapping.get(id).filter(|&v| predicate(v)) {
+                None => &[],
+                Some(rewrite) => rewrite.new_parent_ids(),
+            },
+        );
+        let mut new_mapping: HashMap<CommitId, Vec<CommitId>> = HashMap::new();
+        for old_id in sorted_ids {
+            let Some(rewrite) = self.parent_mapping.get(old_id).filter(|&v| predicate(v)) else {
+                continue;
+            };
+            let lookup = |id| new_mapping.get(id).map_or(slice::from_ref(id), |ids| ids);
+            let new_ids = match rewrite.new_parent_ids() {
+                [id] => lookup(id).to_vec(), // unique() not needed
+                ids => ids.iter().flat_map(lookup).unique().cloned().collect(),
+            };
+            debug_assert_eq!(
+                new_ids,
+                self.rewritten_ids_with(slice::from_ref(old_id), &mut predicate)
+            );
+            new_mapping.insert(old_id.clone(), new_ids);
         }
+        new_mapping
     }
 
     /// Updates branches, working copies, and anonymous heads after rewriting
@@ -1022,102 +1076,77 @@ impl MutableRepo {
     }
 
     fn update_all_references(&mut self, settings: &UserSettings) -> BackendResult<()> {
-        for (old_parent_id, rewrite) in self.parent_mapping.clone() {
-            // Call `new_parents()` here since `parent_mapping` only contains direct
-            // mappings, not transitive ones.
-            // TODO: keep parent_mapping updated with transitive mappings so we don't need
-            // to call `new_parents()` here.
-            let new_parent_ids = self.new_parents(rewrite.new_parent_ids().to_vec());
-            self.update_references(settings, old_parent_id, new_parent_ids)?;
-        }
+        let rewrite_mapping = self.resolve_rewrite_mapping_with(|_| true);
+        self.update_local_branches(&rewrite_mapping);
+        self.update_wc_commits(settings, &rewrite_mapping)?;
         Ok(())
     }
 
-    fn update_references(
-        &mut self,
-        settings: &UserSettings,
-        old_commit_id: CommitId,
-        new_commit_ids: Vec<CommitId>,
-    ) -> BackendResult<()> {
-        let abandoned_old_commit = matches!(
-            self.parent_mapping.get(&old_commit_id),
-            Some(Rewrite::Abandoned(_))
-        );
-        self.update_wc_commits(
-            settings,
-            &old_commit_id,
-            &new_commit_ids,
-            abandoned_old_commit,
-        )?;
-
-        // Build a map from commit to branches pointing to it, so we don't need to scan
-        // all branches each time we rebase a commit.
-        // TODO: We no longer need to do this now that we update branches for all
-        // commits at once.
-        let mut branches: HashMap<_, HashSet<_>> = HashMap::new();
-        for (branch_name, target) in self.view().local_branches() {
-            for commit in target.added_ids() {
-                branches
-                    .entry(commit.clone())
-                    .or_default()
-                    .insert(branch_name.to_owned());
-            }
-        }
-
-        if let Some(branch_names) = branches.get(&old_commit_id).cloned() {
-            let mut branch_updates = vec![];
-            for branch_name in &branch_names {
-                let local_target = self.get_local_branch(branch_name);
-                for old_add in local_target.added_ids() {
-                    if *old_add == old_commit_id {
-                        branch_updates.push(branch_name.clone());
-                    }
-                }
-            }
-
+    fn update_local_branches(&mut self, rewrite_mapping: &HashMap<CommitId, Vec<CommitId>>) {
+        let changed_branches = self
+            .view()
+            .local_branches()
+            .flat_map(|(name, target)| {
+                target.added_ids().filter_map(|id| {
+                    let change = rewrite_mapping.get_key_value(id)?;
+                    Some((name.to_owned(), change))
+                })
+            })
+            .collect_vec();
+        for (branch_name, (old_commit_id, new_commit_ids)) in changed_branches {
             let old_target = RefTarget::normal(old_commit_id.clone());
-            assert!(!new_commit_ids.is_empty());
-            let new_target = RefTarget::from_legacy_form(
-                std::iter::repeat(old_commit_id).take(new_commit_ids.len() - 1),
-                new_commit_ids,
+            let new_target = RefTarget::from_merge(
+                MergeBuilder::from_iter(
+                    itertools::intersperse(new_commit_ids, old_commit_id)
+                        .map(|id| Some(id.clone())),
+                )
+                .build(),
             );
-            for branch_name in &branch_updates {
-                self.merge_local_branch(branch_name, &old_target, &new_target);
-            }
+            self.merge_local_branch(&branch_name, &old_target, &new_target);
         }
-
-        Ok(())
     }
 
     fn update_wc_commits(
         &mut self,
         settings: &UserSettings,
-        old_commit_id: &CommitId,
-        new_commit_ids: &[CommitId],
-        abandoned_old_commit: bool,
+        rewrite_mapping: &HashMap<CommitId, Vec<CommitId>>,
     ) -> BackendResult<()> {
-        let workspaces_to_update = self.view().workspaces_for_wc_commit_id(old_commit_id);
-        if workspaces_to_update.is_empty() {
-            return Ok(());
-        }
-
-        let new_wc_commit = if !abandoned_old_commit {
-            // We arbitrarily pick a new working-copy commit among the candidates.
-            self.store().get_commit(&new_commit_ids[0])?
-        } else {
-            let new_commits: Vec<_> = new_commit_ids
-                .iter()
-                .map(|id| self.store().get_commit(id))
-                .try_collect()?;
-            let merged_parents_tree = merge_commit_trees(self, &new_commits)?;
-            self.new_commit(
-                settings,
-                new_commit_ids.to_vec(),
-                merged_parents_tree.id().clone(),
-            )
-            .write()?
-        };
-        for workspace_id in workspaces_to_update.into_iter() {
+        let changed_wc_commits = self
+            .view()
+            .wc_commit_ids()
+            .iter()
+            .filter_map(|(workspace_id, commit_id)| {
+                let change = rewrite_mapping.get_key_value(commit_id)?;
+                Some((workspace_id.to_owned(), change))
+            })
+            .collect_vec();
+        let mut recreated_wc_commits: HashMap<&CommitId, Commit> = HashMap::new();
+        for (workspace_id, (old_commit_id, new_commit_ids)) in changed_wc_commits {
+            let abandoned_old_commit = matches!(
+                self.parent_mapping.get(old_commit_id),
+                Some(Rewrite::Abandoned(_))
+            );
+            let new_wc_commit = if !abandoned_old_commit {
+                // We arbitrarily pick a new working-copy commit among the candidates.
+                self.store().get_commit(&new_commit_ids[0])?
+            } else if let Some(commit) = recreated_wc_commits.get(old_commit_id) {
+                commit.clone()
+            } else {
+                let new_commits: Vec<_> = new_commit_ids
+                    .iter()
+                    .map(|id| self.store().get_commit(id))
+                    .try_collect()?;
+                let merged_parents_tree = merge_commit_trees(self, &new_commits)?;
+                let commit = self
+                    .new_commit(
+                        settings,
+                        new_commit_ids.to_vec(),
+                        merged_parents_tree.id().clone(),
+                    )
+                    .write()?;
+                recreated_wc_commits.insert(old_commit_id, commit.clone());
+                commit
+            };
             self.edit(workspace_id, &new_wc_commit).unwrap();
         }
         Ok(())
@@ -1213,7 +1242,7 @@ impl MutableRepo {
     ) -> BackendResult<()> {
         let mut to_visit = self.find_descendants_to_rebase(roots)?;
         while let Some(old_commit) = to_visit.pop() {
-            let new_parent_ids = self.new_parents(old_commit.parent_ids().to_vec());
+            let new_parent_ids = self.new_parents(old_commit.parent_ids());
             let rewriter = CommitRewriter::new(self, old_commit, new_parent_ids);
             callback(rewriter)?;
         }
@@ -1813,7 +1842,8 @@ pub enum CheckOutCommitError {
 }
 
 mod dirty_cell {
-    use std::cell::{OnceCell, RefCell};
+    use std::cell::OnceCell;
+    use std::cell::RefCell;
 
     /// Cell that lazily updates the value after `mark_dirty()`.
     ///

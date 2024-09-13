@@ -22,12 +22,13 @@ use jj_lib::working_copy::SnapshotOptions;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
-use crate::command_error::{user_error_with_hint, CommandError};
+use crate::command_error::user_error_with_hint;
+use crate::command_error::CommandError;
 use crate::ui::Ui;
 
 /// Stop tracking specified paths in the working copy
 #[derive(clap::Args, Clone, Debug)]
-pub(crate) struct UntrackArgs {
+pub(crate) struct FileUntrackArgs {
     /// Paths to untrack. They must already be ignored.
     ///
     /// The paths could be ignored via a .gitignore or .git/info/exclude (in
@@ -37,10 +38,10 @@ pub(crate) struct UntrackArgs {
 }
 
 #[instrument(skip_all)]
-pub(crate) fn cmd_untrack(
+pub(crate) fn cmd_file_untrack(
     ui: &mut Ui,
     command: &CommandHelper,
-    args: &UntrackArgs,
+    args: &FileUntrackArgs,
 ) -> Result<(), CommandError> {
     let mut workspace_command = command.workspace_helper(ui)?;
     let store = workspace_command.repo().store().clone();

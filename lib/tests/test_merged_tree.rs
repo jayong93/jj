@@ -12,21 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::executor::block_on;
 use futures::StreamExt;
 use itertools::Itertools;
-use jj_lib::backend::{FileId, MergedTreeId, TreeValue};
+use jj_lib::backend::CommitId;
+use jj_lib::backend::CopyRecord;
+use jj_lib::backend::FileId;
+use jj_lib::backend::MergedTreeId;
+use jj_lib::backend::TreeValue;
+use jj_lib::copies::CopiesTreeDiffEntryPath;
+use jj_lib::copies::CopyOperation;
+use jj_lib::copies::CopyRecords;
 use jj_lib::files::MergeResult;
-use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher, PrefixMatcher};
-use jj_lib::merge::{Merge, MergeBuilder};
-use jj_lib::merged_tree::{
-    MergedTree, MergedTreeBuilder, MergedTreeVal, TreeDiffIterator, TreeDiffStreamImpl,
-};
+use jj_lib::matchers::EverythingMatcher;
+use jj_lib::matchers::FilesMatcher;
+use jj_lib::matchers::Matcher;
+use jj_lib::matchers::PrefixMatcher;
+use jj_lib::merge::Merge;
+use jj_lib::merge::MergeBuilder;
+use jj_lib::merge::MergedTreeValue;
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree::MergedTreeBuilder;
+use jj_lib::merged_tree::TreeDiffEntry;
+use jj_lib::merged_tree::TreeDiffIterator;
+use jj_lib::merged_tree::TreeDiffStreamImpl;
 use jj_lib::repo::Repo;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponent};
-use jj_lib::tree::merge_trees;
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::repo_path::RepoPathComponent;
+use pollster::FutureExt as _;
 use pretty_assertions::assert_eq;
-use testutils::{create_single_tree, write_file, TestRepo};
+use testutils::create_single_tree;
+use testutils::write_file;
+use testutils::TestRepo;
 
 fn file_value(file_id: &FileId) -> TreeValue {
     TreeValue::File {
@@ -35,16 +52,20 @@ fn file_value(file_id: &FileId) -> TreeValue {
     }
 }
 
+fn diff_entry_tuple(diff: TreeDiffEntry) -> (RepoPathBuf, (MergedTreeValue, MergedTreeValue)) {
+    (diff.path, diff.values.unwrap())
+}
+
 fn diff_stream_equals_iter(tree1: &MergedTree, tree2: &MergedTree, matcher: &dyn Matcher) {
-    let iter_diff: Vec<_> = TreeDiffIterator::new(tree1.clone(), tree2.clone(), matcher)
-        .map(|(path, diff)| (path, diff.unwrap()))
+    let iter_diff: Vec<_> = TreeDiffIterator::new(tree1.as_merge(), tree2.as_merge(), matcher)
+        .map(|diff| (diff.path, diff.values.unwrap()))
         .collect();
     let max_concurrent_reads = 10;
-    let stream_diff: Vec<_> = block_on(
+    let stream_diff: Vec<_> =
         TreeDiffStreamImpl::new(tree1.clone(), tree2.clone(), matcher, max_concurrent_reads)
-            .map(|(path, diff)| (path, diff.unwrap()))
-            .collect(),
-    );
+            .map(|diff| (diff.path, diff.values.unwrap()))
+            .collect()
+            .block_on();
     assert_eq!(stream_diff, iter_diff);
 }
 
@@ -148,52 +169,62 @@ fn test_from_legacy_tree() {
     let merged_tree = MergedTree::from_legacy_tree(tree.clone()).unwrap();
     assert_eq!(
         merged_tree.value(RepoPathComponent::new("missing")),
-        MergedTreeVal::Resolved(None)
+        Merge::absent()
     );
     // file1: regular file without conflicts
     assert_eq!(
-        merged_tree.value(file1_path.components().next().unwrap()),
-        MergedTreeVal::Resolved(Some(&TreeValue::File {
+        merged_tree
+            .value(file1_path.components().next().unwrap())
+            .cloned(),
+        Merge::normal(TreeValue::File {
             id: file1_id.clone(),
             executable: false,
-        }))
+        })
     );
     // file2: 3-way conflict
     assert_eq!(
-        merged_tree.value(file2_path.components().next().unwrap()),
-        MergedTreeVal::Conflict(Merge::from_removes_adds(
+        merged_tree
+            .value(file2_path.components().next().unwrap())
+            .cloned(),
+        Merge::from_removes_adds(
             vec![Some(file_value(&file2_v1_id)), None],
             vec![
                 Some(file_value(&file2_v2_id)),
                 Some(file_value(&file2_v3_id)),
                 None,
             ],
-        ))
+        )
     );
     // file3: modify/delete conflict
     assert_eq!(
-        merged_tree.value(file3_path.components().next().unwrap()),
-        MergedTreeVal::Conflict(Merge::from_removes_adds(
+        merged_tree
+            .value(file3_path.components().next().unwrap())
+            .cloned(),
+        Merge::from_removes_adds(
             vec![Some(file_value(&file3_v1_id)), None],
             vec![Some(file_value(&file3_v2_id)), None, None],
-        ))
+        )
     );
     // file4: add/add conflict
     assert_eq!(
-        merged_tree.value(file4_path.components().next().unwrap()),
-        MergedTreeVal::Conflict(Merge::from_removes_adds(
+        merged_tree
+            .value(file4_path.components().next().unwrap())
+            .cloned(),
+        Merge::from_removes_adds(
             vec![None, None],
             vec![
                 Some(file_value(&file4_v1_id)),
                 Some(file_value(&file4_v2_id)),
                 None
             ],
-        ))
+        )
     );
     // file5: 5-way conflict
     assert_eq!(
-        merged_tree.value(file5_path.components().next().unwrap()),
-        MergedTreeVal::Conflict(Merge::from_removes_adds(
+        merged_tree
+            .value(file5_path.components().next().unwrap())
+            .cloned(),
+        Merge::from_removes_adds(
             vec![
                 Some(file_value(&file5_v1_id)),
                 Some(file_value(&file5_v2_id)),
@@ -203,12 +234,12 @@ fn test_from_legacy_tree() {
                 Some(file_value(&file5_v4_id)),
                 Some(file_value(&file5_v5_id)),
             ],
-        ))
+        )
     );
     // file6: directory without conflicts
     assert_eq!(
         merged_tree.value(dir1_basename),
-        MergedTreeVal::Resolved(tree.value(dir1_basename))
+        Merge::resolved(tree.value(dir1_basename))
     );
 
     // Create the merged tree by starting from an empty merged tree and adding
@@ -307,7 +338,7 @@ fn test_path_value_and_entries() {
             (file_dir_conflict_sub_path, "1"),
         ],
     );
-    let merged_tree = MergedTree::Merge(Merge::from_removes_adds(
+    let merged_tree = MergedTree::new(Merge::from_removes_adds(
         vec![tree1.clone()],
         vec![tree2.clone(), tree3.clone()],
     ));
@@ -455,9 +486,7 @@ fn test_resolve_success() {
     );
 
     let tree = MergedTree::new(Merge::from_removes_adds(vec![base1], vec![side1, side2]));
-    let MergedTree::Merge(resolved) = tree.resolve().unwrap() else {
-        unreachable!()
-    };
+    let resolved = tree.resolve().unwrap().take();
     let resolved_tree = resolved.as_resolved().unwrap().clone();
     assert_eq!(
         resolved_tree,
@@ -662,13 +691,8 @@ fn test_conflict_iterator() {
             ),
         ]
     );
-
-    let merged_legacy_tree = merge_trees(&side1, &base1, &side2).unwrap();
-    let legacy_conflicts = MergedTree::legacy(merged_legacy_tree)
-        .conflicts()
-        .collect_vec();
-    assert_eq!(legacy_conflicts, conflicts);
 }
+
 #[test]
 fn test_conflict_iterator_higher_arity() {
     let test_repo = TestRepo::init();
@@ -723,29 +747,6 @@ fn test_conflict_iterator_higher_arity() {
             (three_sided_path.to_owned(), conflict_at(three_sided_path))
         ]
     );
-    // Iterating over conflicts in a legacy tree yields the simplified conflict at
-    // each path
-    let merged_legacy_tree = merge_trees(&side1, &base1, &side2).unwrap();
-    let merged_legacy_tree = merge_trees(&merged_legacy_tree, &base2, &side3).unwrap();
-    let legacy_conflicts = MergedTree::legacy(merged_legacy_tree)
-        .conflicts()
-        .collect_vec();
-    assert_eq!(
-        legacy_conflicts,
-        vec![
-            (
-                two_sided_path.to_owned(),
-                Merge::from_removes_adds(
-                    vec![base2.path_value(two_sided_path).unwrap()],
-                    vec![
-                        side1.path_value(two_sided_path).unwrap(),
-                        side3.path_value(two_sided_path).unwrap(),
-                    ],
-                )
-            ),
-            (three_sided_path.to_owned(), conflict_at(three_sided_path))
-        ]
-    );
 }
 
 /// Diff two resolved trees
@@ -777,10 +778,11 @@ fn test_diff_resolved() {
     let before_merged = MergedTree::new(Merge::resolved(before.clone()));
     let after_merged = MergedTree::new(Merge::resolved(after.clone()));
 
-    let diff = before_merged
-        .diff(&after_merged, &EverythingMatcher)
-        .map(|(path, diff)| (path, diff.unwrap()))
-        .collect_vec();
+    let diff: Vec<_> = before_merged
+        .diff_stream(&after_merged, &EverythingMatcher)
+        .map(diff_entry_tuple)
+        .collect()
+        .block_on();
     assert_eq!(diff.len(), 3);
     assert_eq!(
         diff[0].clone(),
@@ -808,6 +810,104 @@ fn test_diff_resolved() {
             added_path.to_owned(),
             (
                 Merge::absent(),
+                Merge::resolved(after.path_value(added_path).unwrap())
+            ),
+        )
+    );
+    diff_stream_equals_iter(&before_merged, &after_merged, &EverythingMatcher);
+}
+
+fn create_copy_records(paths: &[(&RepoPath, &RepoPath)]) -> CopyRecords {
+    let mut copy_records = CopyRecords::default();
+    copy_records
+        .add_records(paths.iter().map(|&(source, target)| {
+            Ok(CopyRecord {
+                source: source.to_owned(),
+                target: target.to_owned(),
+                target_commit: CommitId::new(vec![]),
+                source_commit: CommitId::new(vec![]),
+                source_file: FileId::new(vec![]),
+            })
+        }))
+        .unwrap();
+    copy_records
+}
+
+/// Diff two resolved trees
+#[test]
+fn test_diff_copy_tracing() {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+
+    let clean_path = RepoPath::from_internal_string("1/clean/path");
+    let modified_path = RepoPath::from_internal_string("2/modified/path");
+    let copied_path = RepoPath::from_internal_string("3/copied/path");
+    let removed_path = RepoPath::from_internal_string("4/removed/path");
+    let added_path = RepoPath::from_internal_string("5/added/path");
+    let before = create_single_tree(
+        repo,
+        &[
+            (clean_path, "clean"),
+            (modified_path, "before"),
+            (removed_path, "before"),
+        ],
+    );
+    let after = create_single_tree(
+        repo,
+        &[
+            (clean_path, "clean"),
+            (modified_path, "after"),
+            (copied_path, "after"),
+            (added_path, "after"),
+        ],
+    );
+    let before_merged = MergedTree::new(Merge::resolved(before.clone()));
+    let after_merged = MergedTree::new(Merge::resolved(after.clone()));
+
+    let copy_records =
+        create_copy_records(&[(removed_path, added_path), (modified_path, copied_path)]);
+
+    let diff: Vec<_> = before_merged
+        .diff_stream_with_copies(&after_merged, &EverythingMatcher, &copy_records)
+        .map(|diff| (diff.path, diff.values.unwrap()))
+        .collect()
+        .block_on();
+    assert_eq!(diff.len(), 3);
+    assert_eq!(
+        diff[0].clone(),
+        (
+            CopiesTreeDiffEntryPath {
+                source: None,
+                target: modified_path.to_owned(),
+            },
+            (
+                Merge::resolved(before.path_value(modified_path).unwrap()),
+                Merge::resolved(after.path_value(modified_path).unwrap())
+            ),
+        )
+    );
+    assert_eq!(
+        diff[1].clone(),
+        (
+            CopiesTreeDiffEntryPath {
+                source: Some((modified_path.to_owned(), CopyOperation::Copy)),
+                target: copied_path.to_owned(),
+            },
+            (
+                Merge::resolved(before.path_value(modified_path).unwrap()),
+                Merge::resolved(after.path_value(copied_path).unwrap()),
+            ),
+        )
+    );
+    assert_eq!(
+        diff[2].clone(),
+        (
+            CopiesTreeDiffEntryPath {
+                source: Some((removed_path.to_owned(), CopyOperation::Rename)),
+                target: added_path.to_owned(),
+            },
+            (
+                Merge::resolved(before.path_value(removed_path).unwrap()),
                 Merge::resolved(after.path_value(added_path).unwrap())
             ),
         )
@@ -886,10 +986,11 @@ fn test_diff_conflicted() {
     ));
 
     // Test the forwards diff
-    let actual_diff = left_merged
-        .diff(&right_merged, &EverythingMatcher)
-        .map(|(path, diff)| (path, diff.unwrap()))
-        .collect_vec();
+    let actual_diff: Vec<_> = left_merged
+        .diff_stream(&right_merged, &EverythingMatcher)
+        .map(diff_entry_tuple)
+        .collect()
+        .block_on();
     let expected_diff = [path2, path3, path4]
         .iter()
         .map(|&path| {
@@ -905,10 +1006,11 @@ fn test_diff_conflicted() {
     assert_eq!(actual_diff, expected_diff);
     diff_stream_equals_iter(&left_merged, &right_merged, &EverythingMatcher);
     // Test the reverse diff
-    let actual_diff = right_merged
-        .diff(&left_merged, &EverythingMatcher)
-        .map(|(path, diff)| (path, diff.unwrap()))
-        .collect_vec();
+    let actual_diff: Vec<_> = right_merged
+        .diff_stream(&left_merged, &EverythingMatcher)
+        .map(diff_entry_tuple)
+        .collect()
+        .block_on();
     let expected_diff = [path2, path3, path4]
         .iter()
         .map(|&path| {
@@ -1022,10 +1124,11 @@ fn test_diff_dir_file() {
 
     // Test the forwards diff
     {
-        let actual_diff = left_merged
-            .diff(&right_merged, &EverythingMatcher)
-            .map(|(path, diff)| (path, diff.unwrap()))
-            .collect_vec();
+        let actual_diff: Vec<_> = left_merged
+            .diff_stream(&right_merged, &EverythingMatcher)
+            .map(diff_entry_tuple)
+            .collect()
+            .block_on();
         let expected_diff = vec![
             // path1: file1 -> directory1
             (path1.to_owned(), (left_value(path1), Merge::absent())),
@@ -1066,10 +1169,11 @@ fn test_diff_dir_file() {
 
     // Test the reverse diff
     {
-        let actual_diff = right_merged
-            .diff(&left_merged, &EverythingMatcher)
-            .map(|(path, diff)| (path, diff.unwrap()))
-            .collect_vec();
+        let actual_diff: Vec<_> = right_merged
+            .diff_stream(&left_merged, &EverythingMatcher)
+            .map(diff_entry_tuple)
+            .collect()
+            .block_on();
         let expected_diff = vec![
             // path1: file1 -> directory1
             (
@@ -1111,10 +1215,11 @@ fn test_diff_dir_file() {
     // Diff while filtering by `path1` (file1 -> directory1) as a file
     {
         let matcher = FilesMatcher::new([&path1]);
-        let actual_diff = left_merged
-            .diff(&right_merged, &matcher)
-            .map(|(path, diff)| (path, diff.unwrap()))
-            .collect_vec();
+        let actual_diff: Vec<_> = left_merged
+            .diff_stream(&right_merged, &matcher)
+            .map(diff_entry_tuple)
+            .collect()
+            .block_on();
         let expected_diff = vec![
             // path1: file1 -> directory1
             (path1.to_owned(), (left_value(path1), Merge::absent())),
@@ -1126,10 +1231,11 @@ fn test_diff_dir_file() {
     // Diff while filtering by `path1/file` (file1 -> directory1) as a file
     {
         let matcher = FilesMatcher::new([path1.join(file)]);
-        let actual_diff = left_merged
-            .diff(&right_merged, &matcher)
-            .map(|(path, diff)| (path, diff.unwrap()))
-            .collect_vec();
+        let actual_diff: Vec<_> = left_merged
+            .diff_stream(&right_merged, &matcher)
+            .map(diff_entry_tuple)
+            .collect()
+            .block_on();
         let expected_diff = vec![
             // path1: file1 -> directory1
             (
@@ -1144,10 +1250,11 @@ fn test_diff_dir_file() {
     // Diff while filtering by `path1` (file1 -> directory1) as a prefix
     {
         let matcher = PrefixMatcher::new([&path1]);
-        let actual_diff = left_merged
-            .diff(&right_merged, &matcher)
-            .map(|(path, diff)| (path, diff.unwrap()))
-            .collect_vec();
+        let actual_diff: Vec<_> = left_merged
+            .diff_stream(&right_merged, &matcher)
+            .map(diff_entry_tuple)
+            .collect()
+            .block_on();
         let expected_diff = vec![
             (path1.to_owned(), (left_value(path1), Merge::absent())),
             (
@@ -1165,10 +1272,11 @@ fn test_diff_dir_file() {
     // side.
     {
         let matcher = FilesMatcher::new([&path6]);
-        let actual_diff = left_merged
-            .diff(&right_merged, &matcher)
-            .map(|(path, diff)| (path, diff.unwrap()))
-            .collect_vec();
+        let actual_diff: Vec<_> = left_merged
+            .diff_stream(&right_merged, &matcher)
+            .map(diff_entry_tuple)
+            .collect()
+            .block_on();
         let expected_diff = vec![(path6.to_owned(), (Merge::absent(), right_value(path6)))];
         assert_eq!(actual_diff, expected_diff);
         diff_stream_equals_iter(&left_merged, &right_merged, &matcher);
@@ -1218,30 +1326,6 @@ fn test_merge_partial_resolution() {
         vec![expected_base1],
         vec![expected_side1, expected_side2],
     ));
-
-    let merged = side1_merged.merge(&base1_merged, &side2_merged).unwrap();
-    assert_eq!(merged, expected_merged);
-}
-
-/// Merge 3 resolved trees, including one empty legacy tree
-#[test]
-fn test_merge_with_empty_legacy_tree() {
-    let test_repo = TestRepo::init();
-    let repo = &test_repo.repo;
-
-    let path1 = RepoPath::from_internal_string("dir1/file");
-    let path2 = RepoPath::from_internal_string("dir2/file");
-    let base1 = repo
-        .store()
-        .get_tree(RepoPath::root(), repo.store().empty_tree_id())
-        .unwrap();
-    let side1 = create_single_tree(repo, &[(path1, "side1")]);
-    let side2 = create_single_tree(repo, &[(path2, "side2")]);
-    let expected = create_single_tree(repo, &[(path1, "side1"), (path2, "side2")]);
-    let base1_merged = MergedTree::legacy(base1);
-    let side1_merged = MergedTree::new(Merge::resolved(side1));
-    let side2_merged = MergedTree::new(Merge::resolved(side2));
-    let expected_merged = MergedTree::new(Merge::resolved(expected));
 
     let merged = side1_merged.merge(&base1_merged, &side2_merged).unwrap();
     assert_eq!(merged, expected_merged);

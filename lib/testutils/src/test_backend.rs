@@ -14,21 +14,42 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::fmt::{Debug, Error, Formatter};
-use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::fmt::Debug;
+use std::fmt::Error;
+use std::fmt::Formatter;
+use std::io::Cursor;
+use std::io::Read;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use futures::stream;
 use futures::stream::BoxStream;
-use jj_lib::backend::{
-    make_root_commit, Backend, BackendError, BackendResult, ChangeId, Commit, CommitId, Conflict,
-    ConflictId, CopyRecord, FileId, SecureSig, SigningFn, SymlinkId, Tree, TreeId,
-};
+use jj_lib::backend::make_root_commit;
+use jj_lib::backend::Backend;
+use jj_lib::backend::BackendError;
+use jj_lib::backend::BackendResult;
+use jj_lib::backend::ChangeId;
+use jj_lib::backend::Commit;
+use jj_lib::backend::CommitId;
+use jj_lib::backend::Conflict;
+use jj_lib::backend::ConflictId;
+use jj_lib::backend::CopyRecord;
+use jj_lib::backend::FileId;
+use jj_lib::backend::SecureSig;
+use jj_lib::backend::SigningFn;
+use jj_lib::backend::SymlinkId;
+use jj_lib::backend::Tree;
+use jj_lib::backend::TreeId;
 use jj_lib::index::Index;
 use jj_lib::object_id::ObjectId;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf};
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
 
 const HASH_LENGTH: usize = 10;
 const CHANGE_ID_LENGTH: usize = 16;
@@ -303,11 +324,11 @@ impl Backend for TestBackend {
 
     fn get_copy_records(
         &self,
-        _paths: &[RepoPathBuf],
-        _roots: &[CommitId],
-        _heads: &[CommitId],
+        _paths: Option<&[RepoPathBuf]>,
+        _root: &CommitId,
+        _head: &CommitId,
     ) -> BackendResult<BoxStream<BackendResult<CopyRecord>>> {
-        Err(BackendError::Unsupported("get_copy_records".into()))
+        Ok(Box::pin(stream::empty()))
     }
 
     fn gc(&self, _index: &dyn Index, _keep_newer: SystemTime) -> BackendResult<()> {

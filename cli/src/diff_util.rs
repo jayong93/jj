@@ -12,28 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Borrow;
 use std::cmp::max;
-use std::collections::VecDeque;
+use std::collections::HashSet;
+use std::io;
+use std::mem;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::{io, mem};
+use std::path::Path;
+use std::path::PathBuf;
 
+use futures::executor::block_on_stream;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use itertools::Itertools;
-use jj_lib::backend::{BackendError, TreeValue};
+use jj_lib::backend::BackendError;
+use jj_lib::backend::BackendResult;
+use jj_lib::backend::CommitId;
+use jj_lib::backend::CopyRecord;
+use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
-use jj_lib::conflicts::{materialized_diff_stream, MaterializedTreeValue};
-use jj_lib::diff::{Diff, DiffHunk};
+use jj_lib::conflicts::materialize_merge_result;
+use jj_lib::conflicts::materialized_diff_stream;
+use jj_lib::conflicts::MaterializedTreeDiffEntry;
+use jj_lib::conflicts::MaterializedTreeValue;
+use jj_lib::copies::CopiesTreeDiffEntry;
+use jj_lib::copies::CopyOperation;
+use jj_lib::copies::CopyRecords;
+use jj_lib::diff::Diff;
+use jj_lib::diff::DiffHunk;
 use jj_lib::files::DiffLine;
+use jj_lib::files::DiffLineHunkSide;
+use jj_lib::files::DiffLineIterator;
+use jj_lib::files::DiffLineNumber;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::MergedTreeValue;
-use jj_lib::merged_tree::{MergedTree, TreeDiffStream};
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
-use jj_lib::repo_path::{RepoPath, RepoPathUiConverter};
-use jj_lib::settings::{ConfigResultExt as _, UserSettings};
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathUiConverter;
+use jj_lib::settings::ConfigResultExt as _;
+use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
-use jj_lib::{diff, files};
 use pollster::FutureExt;
 use thiserror::Error;
 use tracing::instrument;
@@ -41,10 +61,13 @@ use unicode_width::UnicodeWidthStr as _;
 
 use crate::config::CommandNameAndArgs;
 use crate::formatter::Formatter;
-use crate::merge_tools::{
-    self, generate_diff, invoke_external_diff, new_utf8_temp_dir, DiffGenerateError, DiffToolMode,
-    ExternalMergeTool,
-};
+use crate::merge_tools;
+use crate::merge_tools::generate_diff;
+use crate::merge_tools::invoke_external_diff;
+use crate::merge_tools::new_utf8_temp_dir;
+use crate::merge_tools::DiffGenerateError;
+use crate::merge_tools::DiffToolMode;
+use crate::merge_tools::ExternalMergeTool;
 use crate::text_util;
 use crate::ui::Ui;
 
@@ -92,12 +115,13 @@ pub struct DiffFormatArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiffFormat {
+    // Non-trivial parameters are boxed in order to keep the variants small
     Summary,
     Stat,
     Types,
     NameOnly,
     Git { context: usize },
-    ColorWords { context: usize },
+    ColorWords(Box<ColorWordsOptions>),
     Tool(Box<ExternalMergeTool>),
 }
 
@@ -108,7 +132,7 @@ pub fn diff_formats_for(
 ) -> Result<Vec<DiffFormat>, config::ConfigError> {
     let formats = diff_formats_from_args(settings, args)?;
     if formats.is_empty() {
-        Ok(vec![default_diff_format(settings, args.context)?])
+        Ok(vec![default_diff_format(settings, args)?])
     } else {
         Ok(formats)
     }
@@ -124,7 +148,7 @@ pub fn diff_formats_for_log(
     let mut formats = diff_formats_from_args(settings, args)?;
     // --patch implies default if no format other than --summary is specified
     if patch && matches!(formats.as_slice(), [] | [DiffFormat::Summary]) {
-        formats.push(default_diff_format(settings, args.context)?);
+        formats.push(default_diff_format(settings, args)?);
         formats.dedup();
     }
     Ok(formats)
@@ -134,27 +158,27 @@ fn diff_formats_from_args(
     settings: &UserSettings,
     args: &DiffFormatArgs,
 ) -> Result<Vec<DiffFormat>, config::ConfigError> {
-    let mut formats = [
-        (args.summary, DiffFormat::Summary),
-        (args.types, DiffFormat::Types),
-        (args.name_only, DiffFormat::NameOnly),
-        (
-            args.git,
-            DiffFormat::Git {
-                context: args.context.unwrap_or(DEFAULT_CONTEXT_LINES),
-            },
-        ),
-        (
-            args.color_words,
-            DiffFormat::ColorWords {
-                context: args.context.unwrap_or(DEFAULT_CONTEXT_LINES),
-            },
-        ),
-        (args.stat, DiffFormat::Stat),
-    ]
-    .into_iter()
-    .filter_map(|(arg, format)| arg.then_some(format))
-    .collect_vec();
+    let mut formats = Vec::new();
+    if args.summary {
+        formats.push(DiffFormat::Summary);
+    }
+    if args.types {
+        formats.push(DiffFormat::Types);
+    }
+    if args.name_only {
+        formats.push(DiffFormat::NameOnly);
+    }
+    if args.git {
+        let context = args.context.unwrap_or(DEFAULT_CONTEXT_LINES);
+        formats.push(DiffFormat::Git { context });
+    }
+    if args.color_words {
+        let options = ColorWordsOptions::from_settings_and_args(settings, args)?;
+        formats.push(DiffFormat::ColorWords(Box::new(options)));
+    }
+    if args.stat {
+        formats.push(DiffFormat::Stat);
+    }
     if let Some(name) = &args.tool {
         let tool = merge_tools::get_external_tool_config(settings, name)?
             .unwrap_or_else(|| ExternalMergeTool::with_program(name));
@@ -165,7 +189,7 @@ fn diff_formats_from_args(
 
 fn default_diff_format(
     settings: &UserSettings,
-    num_context_lines: Option<usize>,
+    args: &DiffFormatArgs,
 ) -> Result<DiffFormat, config::ConfigError> {
     let config = settings.config();
     if let Some(args) = config.get("ui.diff.tool").optional()? {
@@ -190,11 +214,12 @@ fn default_diff_format(
         "types" => Ok(DiffFormat::Types),
         "name-only" => Ok(DiffFormat::NameOnly),
         "git" => Ok(DiffFormat::Git {
-            context: num_context_lines.unwrap_or(DEFAULT_CONTEXT_LINES),
+            context: args.context.unwrap_or(DEFAULT_CONTEXT_LINES),
         }),
-        "color-words" => Ok(DiffFormat::ColorWords {
-            context: num_context_lines.unwrap_or(DEFAULT_CONTEXT_LINES),
-        }),
+        "color-words" => {
+            let options = ColorWordsOptions::from_settings_and_args(settings, args)?;
+            Ok(DiffFormat::ColorWords(Box::new(options)))
+        }
         "stat" => Ok(DiffFormat::Stat),
         _ => Err(config::ConfigError::Message(format!(
             "invalid diff format: {name}"
@@ -238,6 +263,7 @@ impl<'a> DiffRenderer<'a> {
     }
 
     /// Generates diff between `from_tree` and `to_tree`.
+    #[allow(clippy::too_many_arguments)]
     pub fn show_diff(
         &self,
         ui: &Ui, // TODO: remove Ui dependency if possible
@@ -245,13 +271,23 @@ impl<'a> DiffRenderer<'a> {
         from_tree: &MergedTree,
         to_tree: &MergedTree,
         matcher: &dyn Matcher,
+        copy_records: &CopyRecords,
         width: usize,
     ) -> Result<(), DiffRenderError> {
         formatter.with_label("diff", |formatter| {
-            self.show_diff_inner(ui, formatter, from_tree, to_tree, matcher, width)
+            self.show_diff_inner(
+                ui,
+                formatter,
+                from_tree,
+                to_tree,
+                matcher,
+                copy_records,
+                width,
+            )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn show_diff_inner(
         &self,
         ui: &Ui,
@@ -259,6 +295,7 @@ impl<'a> DiffRenderer<'a> {
         from_tree: &MergedTree,
         to_tree: &MergedTree,
         matcher: &dyn Matcher,
+        copy_records: &CopyRecords,
         width: usize,
     ) -> Result<(), DiffRenderError> {
         let store = self.repo.store();
@@ -266,33 +303,40 @@ impl<'a> DiffRenderer<'a> {
         for format in &self.formats {
             match format {
                 DiffFormat::Summary => {
-                    let tree_diff = from_tree.diff_stream(to_tree, matcher);
+                    let tree_diff =
+                        from_tree.diff_stream_with_copies(to_tree, matcher, copy_records);
                     show_diff_summary(formatter, tree_diff, path_converter)?;
                 }
                 DiffFormat::Stat => {
-                    let tree_diff = from_tree.diff_stream(to_tree, matcher);
+                    let tree_diff =
+                        from_tree.diff_stream_with_copies(to_tree, matcher, copy_records);
                     show_diff_stat(formatter, store, tree_diff, path_converter, width)?;
                 }
                 DiffFormat::Types => {
-                    let tree_diff = from_tree.diff_stream(to_tree, matcher);
+                    let tree_diff =
+                        from_tree.diff_stream_with_copies(to_tree, matcher, copy_records);
                     show_types(formatter, tree_diff, path_converter)?;
                 }
                 DiffFormat::NameOnly => {
-                    let tree_diff = from_tree.diff_stream(to_tree, matcher);
+                    let tree_diff =
+                        from_tree.diff_stream_with_copies(to_tree, matcher, copy_records);
                     show_names(formatter, tree_diff, path_converter)?;
                 }
                 DiffFormat::Git { context } => {
-                    let tree_diff = from_tree.diff_stream(to_tree, matcher);
+                    let tree_diff =
+                        from_tree.diff_stream_with_copies(to_tree, matcher, copy_records);
                     show_git_diff(formatter, store, tree_diff, *context)?;
                 }
-                DiffFormat::ColorWords { context } => {
-                    let tree_diff = from_tree.diff_stream(to_tree, matcher);
-                    show_color_words_diff(formatter, store, tree_diff, path_converter, *context)?;
+                DiffFormat::ColorWords(options) => {
+                    let tree_diff =
+                        from_tree.diff_stream_with_copies(to_tree, matcher, copy_records);
+                    show_color_words_diff(formatter, store, tree_diff, path_converter, options)?;
                 }
                 DiffFormat::Tool(tool) => {
                     match tool.diff_invocation_mode {
                         DiffToolMode::FileByFile => {
-                            let tree_diff = from_tree.diff_stream(to_tree, matcher);
+                            let tree_diff =
+                                from_tree.diff_stream_with_copies(to_tree, matcher, copy_records);
                             show_file_by_file_diff(
                                 ui,
                                 formatter,
@@ -324,129 +368,294 @@ impl<'a> DiffRenderer<'a> {
     ) -> Result<(), DiffRenderError> {
         let from_tree = commit.parent_tree(self.repo)?;
         let to_tree = commit.tree()?;
-        self.show_diff(ui, formatter, &from_tree, &to_tree, matcher, width)
+        let mut copy_records = CopyRecords::default();
+        for parent_id in commit.parent_ids() {
+            let records = get_copy_records(self.repo.store(), parent_id, commit.id(), matcher)?;
+            copy_records.add_records(records)?;
+        }
+        self.show_diff(
+            ui,
+            formatter,
+            &from_tree,
+            &to_tree,
+            matcher,
+            &copy_records,
+            width,
+        )
+    }
+}
+
+pub fn get_copy_records<'a>(
+    store: &'a Store,
+    root: &CommitId,
+    head: &CommitId,
+    matcher: &'a dyn Matcher,
+) -> BackendResult<impl Iterator<Item = BackendResult<CopyRecord>> + 'a> {
+    // TODO: teach backend about matching path prefixes?
+    let stream = store.get_copy_records(None, root, head)?;
+    // TODO: test record.source as well? should be AND-ed or OR-ed?
+    Ok(block_on_stream(stream).filter_ok(|record| matcher.matches(&record.target)))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColorWordsOptions {
+    /// Number of context lines to show.
+    pub context: usize,
+    /// Maximum number of removed/added word alternation to inline.
+    pub max_inline_alternation: Option<usize>,
+}
+
+impl ColorWordsOptions {
+    fn from_settings_and_args(
+        settings: &UserSettings,
+        args: &DiffFormatArgs,
+    ) -> Result<Self, config::ConfigError> {
+        let config = settings.config();
+        let max_inline_alternation = {
+            let key = "diff.color-words.max-inline-alternation";
+            match config.get_int(key)? {
+                -1 => None, // unlimited
+                n => Some(usize::try_from(n).map_err(|err| {
+                    config::ConfigError::Message(format!("invalid {key}: {err}"))
+                })?),
+            }
+        };
+        Ok(ColorWordsOptions {
+            context: args.context.unwrap_or(DEFAULT_CONTEXT_LINES),
+            max_inline_alternation,
+        })
     }
 }
 
 fn show_color_words_diff_hunks(
+    formatter: &mut dyn Formatter,
     left: &[u8],
     right: &[u8],
-    num_context_lines: usize,
-    formatter: &mut dyn Formatter,
+    options: &ColorWordsOptions,
 ) -> io::Result<()> {
-    const SKIPPED_CONTEXT_LINE: &str = "    ...\n";
-    let mut context = VecDeque::new();
-    // Have we printed "..." for any skipped context?
-    let mut skipped_context = false;
-    // Are the lines in `context` to be printed before the next modified line?
-    let mut context_before = true;
-    for diff_line in files::diff(left, right) {
-        if diff_line.is_unmodified() {
-            context.push_back(diff_line.clone());
-            let mut start_skipping_context = false;
-            if context_before {
-                if skipped_context && context.len() > num_context_lines {
-                    context.pop_front();
-                } else if !skipped_context && context.len() > num_context_lines + 1 {
-                    start_skipping_context = true;
-                }
-            } else if context.len() > num_context_lines * 2 + 1 {
-                for line in context.drain(..num_context_lines) {
-                    show_color_words_diff_line(formatter, &line)?;
-                }
-                start_skipping_context = true;
-            }
-            if start_skipping_context {
-                context.drain(..2);
-                write!(formatter, "{SKIPPED_CONTEXT_LINE}")?;
-                skipped_context = true;
-                context_before = true;
-            }
-        } else {
-            for line in &context {
-                show_color_words_diff_line(formatter, line)?;
-            }
-            context.clear();
-            show_color_words_diff_line(formatter, &diff_line)?;
-            context_before = false;
-            skipped_context = false;
-        }
-    }
-    if !context_before {
-        if context.len() > num_context_lines + 1 {
-            context.truncate(num_context_lines);
-            skipped_context = true;
-            context_before = true;
-        }
-        for line in &context {
-            show_color_words_diff_line(formatter, line)?;
-        }
-        if context_before {
-            write!(formatter, "{SKIPPED_CONTEXT_LINE}")?;
-        }
-    }
+    let line_diff = Diff::by_line([left, right]);
+    let mut line_diff_hunks = line_diff.hunks().peekable();
+    let mut line_number = DiffLineNumber { left: 1, right: 1 };
 
-    // If the last diff line doesn't end with newline, add it.
-    let no_hunk = left.is_empty() && right.is_empty();
-    let any_last_newline = left.ends_with(b"\n") || right.ends_with(b"\n");
-    if !skipped_context && !no_hunk && !any_last_newline {
-        writeln!(formatter)?;
+    // First "before" context
+    if let Some(DiffHunk::Matching(content)) =
+        line_diff_hunks.next_if(|hunk| matches!(hunk, DiffHunk::Matching(_)))
+    {
+        if line_diff_hunks.peek().is_some() {
+            line_number = show_color_words_context_lines(
+                formatter,
+                content,
+                line_number,
+                0,
+                options.context,
+            )?;
+        }
+    }
+    while let Some(hunk) = line_diff_hunks.next() {
+        match hunk {
+            // Middle "after"/"before" context
+            DiffHunk::Matching(content) if line_diff_hunks.peek().is_some() => {
+                line_number = show_color_words_context_lines(
+                    formatter,
+                    content,
+                    line_number,
+                    options.context,
+                    options.context,
+                )?;
+            }
+            // Last "after" context
+            DiffHunk::Matching(content) => {
+                line_number = show_color_words_context_lines(
+                    formatter,
+                    content,
+                    line_number,
+                    options.context,
+                    0,
+                )?;
+            }
+            DiffHunk::Different(contents) => {
+                let word_diff_hunks = Diff::by_word(&contents).hunks().collect_vec();
+                let can_inline = match options.max_inline_alternation {
+                    None => true,     // unlimited
+                    Some(0) => false, // no need to count alternation
+                    Some(max_num) => {
+                        let groups = split_diff_hunks_by_matching_newline(&word_diff_hunks);
+                        groups.map(count_diff_alternation).max().unwrap_or(0) <= max_num
+                    }
+                };
+                if can_inline {
+                    let mut diff_line_iter =
+                        DiffLineIterator::with_line_number(word_diff_hunks.iter(), line_number);
+                    for diff_line in diff_line_iter.by_ref() {
+                        show_color_words_diff_line(formatter, &diff_line)?;
+                    }
+                    line_number = diff_line_iter.next_line_number();
+                } else {
+                    let (left_lines, right_lines) = unzip_diff_hunks_to_lines(&word_diff_hunks);
+                    for tokens in &left_lines {
+                        show_color_words_line_number(formatter, Some(line_number.left), None)?;
+                        show_color_words_single_sided_line(formatter, tokens, "removed")?;
+                        line_number.left += 1;
+                    }
+                    for tokens in &right_lines {
+                        show_color_words_line_number(formatter, None, Some(line_number.right))?;
+                        show_color_words_single_sided_line(formatter, tokens, "added")?;
+                        line_number.right += 1;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
-fn show_color_words_diff_line(
+/// Prints `num_after` lines, ellipsis, and `num_before` lines.
+fn show_color_words_context_lines(
     formatter: &mut dyn Formatter,
-    diff_line: &DiffLine,
+    content: &[u8],
+    mut line_number: DiffLineNumber,
+    num_after: usize,
+    num_before: usize,
+) -> io::Result<DiffLineNumber> {
+    const SKIPPED_CONTEXT_LINE: &str = "    ...\n";
+    let mut lines = content.split_inclusive(|b| *b == b'\n').fuse();
+    for line in lines.by_ref().take(num_after) {
+        let diff_line = DiffLine {
+            line_number,
+            hunks: vec![(DiffLineHunkSide::Both, line.as_ref())],
+        };
+        show_color_words_diff_line(formatter, &diff_line)?;
+        line_number.left += 1;
+        line_number.right += 1;
+    }
+    let mut before_lines = lines.by_ref().rev().take(num_before + 1).collect_vec();
+    let num_skipped: u32 = lines.count().try_into().unwrap();
+    if num_skipped > 0 {
+        write!(formatter, "{SKIPPED_CONTEXT_LINE}")?;
+        before_lines.pop();
+        line_number.left += num_skipped + 1;
+        line_number.right += num_skipped + 1;
+    }
+    for line in before_lines.into_iter().rev() {
+        let diff_line = DiffLine {
+            line_number,
+            hunks: vec![(DiffLineHunkSide::Both, line.as_ref())],
+        };
+        show_color_words_diff_line(formatter, &diff_line)?;
+        line_number.left += 1;
+        line_number.right += 1;
+    }
+    Ok(line_number)
+}
+
+fn show_color_words_line_number(
+    formatter: &mut dyn Formatter,
+    left_line_number: Option<u32>,
+    right_line_number: Option<u32>,
 ) -> io::Result<()> {
-    if diff_line.has_left_content {
+    if let Some(line_number) = left_line_number {
         formatter.with_label("removed", |formatter| {
-            write!(
-                formatter.labeled("line_number"),
-                "{:>4}",
-                diff_line.left_line_number
-            )
+            write!(formatter.labeled("line_number"), "{line_number:>4}")
         })?;
         write!(formatter, " ")?;
     } else {
         write!(formatter, "     ")?;
     }
-    if diff_line.has_right_content {
+    if let Some(line_number) = right_line_number {
         formatter.with_label("added", |formatter| {
-            write!(
-                formatter.labeled("line_number"),
-                "{:>4}",
-                diff_line.right_line_number
-            )
+            write!(formatter.labeled("line_number"), "{line_number:>4}",)
         })?;
         write!(formatter, ": ")?;
     } else {
         write!(formatter, "    : ")?;
     }
-    for hunk in &diff_line.hunks {
-        match hunk {
-            DiffHunk::Matching(data) => {
-                formatter.write_all(data)?;
-            }
-            DiffHunk::Different(data) => {
-                let before = data[0];
-                let after = data[1];
-                if !before.is_empty() {
-                    formatter.with_label("removed", |formatter| {
-                        formatter.with_label("token", |formatter| formatter.write_all(before))
-                    })?;
-                }
-                if !after.is_empty() {
-                    formatter.with_label("added", |formatter| {
-                        formatter.with_label("token", |formatter| formatter.write_all(after))
-                    })?;
-                }
-            }
+    Ok(())
+}
+
+/// Prints `diff_line` which may contain tokens originating from both sides.
+fn show_color_words_diff_line(
+    formatter: &mut dyn Formatter,
+    diff_line: &DiffLine,
+) -> io::Result<()> {
+    show_color_words_line_number(
+        formatter,
+        diff_line
+            .has_left_content()
+            .then_some(diff_line.line_number.left),
+        diff_line
+            .has_right_content()
+            .then_some(diff_line.line_number.right),
+    )?;
+    for (side, data) in &diff_line.hunks {
+        let label = match side {
+            DiffLineHunkSide::Both => None,
+            DiffLineHunkSide::Left => Some("removed"),
+            DiffLineHunkSide::Right => Some("added"),
+        };
+        if let Some(label) = label {
+            formatter.with_label(label, |formatter| {
+                formatter.with_label("token", |formatter| formatter.write_all(data))
+            })?;
+        } else {
+            formatter.write_all(data)?;
         }
     }
-
+    let (_, data) = diff_line.hunks.last().expect("diff line must not be empty");
+    if !data.ends_with(b"\n") {
+        writeln!(formatter)?;
+    };
     Ok(())
+}
+
+/// Prints left/right-only line tokens with the given label.
+fn show_color_words_single_sided_line(
+    formatter: &mut dyn Formatter,
+    tokens: &[(DiffTokenType, &[u8])],
+    label: &str,
+) -> io::Result<()> {
+    formatter.with_label(label, |formatter| show_diff_line_tokens(formatter, tokens))?;
+    let (_, data) = tokens.last().expect("diff line must not be empty");
+    if !data.ends_with(b"\n") {
+        writeln!(formatter)?;
+    };
+    Ok(())
+}
+
+/// Counts number of diff-side alternation, ignoring matching hunks.
+///
+/// This function is meant to measure visual complexity of diff hunks. It's easy
+/// to read hunks containing some removed or added words, but is getting harder
+/// as more removes and adds interleaved.
+///
+/// For example,
+/// - `[matching]` -> 0
+/// - `[left]` -> 1
+/// - `[left, matching, left]` -> 1
+/// - `[matching, left, right, matching, right]` -> 2
+/// - `[left, right, matching, right, left]` -> 3
+fn count_diff_alternation(diff_hunks: &[DiffHunk]) -> usize {
+    diff_hunks
+        .iter()
+        .filter_map(|hunk| match hunk {
+            DiffHunk::Matching(_) => None,
+            DiffHunk::Different(contents) => Some(contents),
+        })
+        // Map non-empty diff side to index (0: left, 1: right)
+        .flat_map(|contents| contents.iter().positions(|content| !content.is_empty()))
+        // Omit e.g. left->(matching->)*left
+        .dedup()
+        .count()
+}
+
+/// Splits hunks into slices of contiguous changed lines.
+fn split_diff_hunks_by_matching_newline<'a, 'b>(
+    diff_hunks: &'a [DiffHunk<'b>],
+) -> impl Iterator<Item = &'a [DiffHunk<'b>]> {
+    diff_hunks.split_inclusive(|hunk| match hunk {
+        DiffHunk::Matching(content) => content.contains(&b'\n'),
+        DiffHunk::Different(_) => false,
+    })
 }
 
 struct FileContent {
@@ -506,13 +715,22 @@ fn diff_content(path: &RepoPath, value: MaterializedTreeValue) -> io::Result<Fil
             contents: format!("Git submodule checked out at {}", id.hex()).into_bytes(),
         }),
         // TODO: are we sure this is never binary?
-        MaterializedTreeValue::Conflict {
+        MaterializedTreeValue::FileConflict {
             id: _,
             contents,
             executable: _,
-        } => Ok(FileContent {
+        } => {
+            let mut data = vec![];
+            materialize_merge_result(&contents, &mut data)
+                .expect("Failed to materialize conflict to in-memory buffer");
+            Ok(FileContent {
+                is_binary: false,
+                contents: data,
+            })
+        }
+        MaterializedTreeValue::OtherConflict { id } => Ok(FileContent {
             is_binary: false,
-            contents,
+            contents: id.describe().into_bytes(),
         }),
         MaterializedTreeValue::Tree(id) => {
             panic!("Unexpected tree with id {id:?} in diff at path {path:?}");
@@ -536,29 +754,40 @@ fn basic_diff_file_type(value: &MaterializedTreeValue) -> &'static str {
         MaterializedTreeValue::Symlink { .. } => "symlink",
         MaterializedTreeValue::Tree(_) => "tree",
         MaterializedTreeValue::GitSubmodule(_) => "Git submodule",
-        MaterializedTreeValue::Conflict { .. } => "conflict",
+        MaterializedTreeValue::FileConflict { .. }
+        | MaterializedTreeValue::OtherConflict { .. } => "conflict",
     }
 }
 
 pub fn show_color_words_diff(
     formatter: &mut dyn Formatter,
     store: &Store,
-    tree_diff: TreeDiffStream,
+    tree_diff: BoxStream<CopiesTreeDiffEntry>,
     path_converter: &RepoPathUiConverter,
-    num_context_lines: usize,
+    options: &ColorWordsOptions,
 ) -> Result<(), DiffRenderError> {
     let mut diff_stream = materialized_diff_stream(store, tree_diff);
     async {
-        while let Some((path, diff)) = diff_stream.next().await {
-            let ui_path = path_converter.format_file_path(&path);
-            let (left_value, right_value) = diff?;
+        while let Some(MaterializedTreeDiffEntry { path, values }) = diff_stream.next().await {
+            let left_path = path.source();
+            let right_path = path.target();
+            let left_ui_path = path_converter.format_file_path(left_path);
+            let right_ui_path = path_converter.format_file_path(right_path);
+            let (left_value, right_value) = values?;
 
             match (&left_value, &right_value) {
-                (_, MaterializedTreeValue::AccessDenied(source))
-                | (MaterializedTreeValue::AccessDenied(source), _) => {
+                (MaterializedTreeValue::AccessDenied(source), _) => {
                     write!(
                         formatter.labeled("access-denied"),
-                        "Access denied to {ui_path}:"
+                        "Access denied to {left_ui_path}:"
+                    )?;
+                    writeln!(formatter, " {source}")?;
+                    continue;
+                }
+                (_, MaterializedTreeValue::AccessDenied(source)) => {
+                    write!(
+                        formatter.labeled("access-denied"),
+                        "Access denied to {right_ui_path}:"
                     )?;
                     writeln!(formatter, " {source}")?;
                     continue;
@@ -569,20 +798,15 @@ pub fn show_color_words_diff(
                 let description = basic_diff_file_type(&right_value);
                 writeln!(
                     formatter.labeled("header"),
-                    "Added {description} {ui_path}:"
+                    "Added {description} {right_ui_path}:"
                 )?;
-                let right_content = diff_content(&path, right_value)?;
+                let right_content = diff_content(right_path, right_value)?;
                 if right_content.is_empty() {
                     writeln!(formatter.labeled("empty"), "    (empty)")?;
                 } else if right_content.is_binary {
                     writeln!(formatter.labeled("binary"), "    (binary)")?;
                 } else {
-                    show_color_words_diff_hunks(
-                        &[],
-                        &right_content.contents,
-                        num_context_lines,
-                        formatter,
-                    )?;
+                    show_color_words_diff_hunks(formatter, &[], &right_content.contents, options)?;
                 }
             } else if right_value.is_present() {
                 let description = match (&left_value, &right_value) {
@@ -607,15 +831,21 @@ pub fn show_color_words_diff(
                         }
                     }
                     (
-                        MaterializedTreeValue::Conflict { .. },
-                        MaterializedTreeValue::Conflict { .. },
+                        MaterializedTreeValue::FileConflict { .. }
+                        | MaterializedTreeValue::OtherConflict { .. },
+                        MaterializedTreeValue::FileConflict { .. }
+                        | MaterializedTreeValue::OtherConflict { .. },
                     ) => "Modified conflict in".to_string(),
-                    (MaterializedTreeValue::Conflict { .. }, _) => {
-                        "Resolved conflict in".to_string()
-                    }
-                    (_, MaterializedTreeValue::Conflict { .. }) => {
-                        "Created conflict in".to_string()
-                    }
+                    (
+                        MaterializedTreeValue::FileConflict { .. }
+                        | MaterializedTreeValue::OtherConflict { .. },
+                        _,
+                    ) => "Resolved conflict in".to_string(),
+                    (
+                        _,
+                        MaterializedTreeValue::FileConflict { .. }
+                        | MaterializedTreeValue::OtherConflict { .. },
+                    ) => "Created conflict in".to_string(),
                     (
                         MaterializedTreeValue::Symlink { .. },
                         MaterializedTreeValue::Symlink { .. },
@@ -632,37 +862,42 @@ pub fn show_color_words_diff(
                         )
                     }
                 };
-                let left_content = diff_content(&path, left_value)?;
-                let right_content = diff_content(&path, right_value)?;
-                writeln!(formatter.labeled("header"), "{description} {ui_path}:")?;
+                let left_content = diff_content(left_path, left_value)?;
+                let right_content = diff_content(right_path, right_value)?;
+                if left_path == right_path {
+                    writeln!(
+                        formatter.labeled("header"),
+                        "{description} {right_ui_path}:"
+                    )?;
+                } else {
+                    writeln!(
+                        formatter.labeled("header"),
+                        "{description} {right_ui_path} ({left_ui_path} => {right_ui_path}):"
+                    )?;
+                }
                 if left_content.is_binary || right_content.is_binary {
                     writeln!(formatter.labeled("binary"), "    (binary)")?;
                 } else {
                     show_color_words_diff_hunks(
+                        formatter,
                         &left_content.contents,
                         &right_content.contents,
-                        num_context_lines,
-                        formatter,
+                        options,
                     )?;
                 }
             } else {
                 let description = basic_diff_file_type(&left_value);
                 writeln!(
                     formatter.labeled("header"),
-                    "Removed {description} {ui_path}:"
+                    "Removed {description} {right_ui_path}:"
                 )?;
-                let left_content = diff_content(&path, left_value)?;
+                let left_content = diff_content(left_path, left_value)?;
                 if left_content.is_empty() {
                     writeln!(formatter.labeled("empty"), "    (empty)")?;
                 } else if left_content.is_binary {
                     writeln!(formatter.labeled("binary"), "    (binary)")?;
                 } else {
-                    show_color_words_diff_hunks(
-                        &left_content.contents,
-                        &[],
-                        num_context_lines,
-                        formatter,
-                    )?;
+                    show_color_words_diff_hunks(formatter, &left_content.contents, &[], options)?;
                 }
             }
         }
@@ -675,7 +910,7 @@ pub fn show_file_by_file_diff(
     ui: &Ui,
     formatter: &mut dyn Formatter,
     store: &Store,
-    tree_diff: TreeDiffStream,
+    tree_diff: BoxStream<CopiesTreeDiffEntry>,
     path_converter: &RepoPathUiConverter,
     tool: &ExternalMergeTool,
 ) -> Result<(), DiffRenderError> {
@@ -696,24 +931,34 @@ pub fn show_file_by_file_diff(
     let right_wc_dir = temp_dir.path().join("right");
     let mut diff_stream = materialized_diff_stream(store, tree_diff);
     async {
-        while let Some((path, diff)) = diff_stream.next().await {
-            let ui_path = path_converter.format_file_path(&path);
-            let (left_value, right_value) = diff?;
+        while let Some(MaterializedTreeDiffEntry { path, values }) = diff_stream.next().await {
+            let (left_value, right_value) = values?;
+            let left_path = path.source();
+            let right_path = path.target();
+            let left_ui_path = path_converter.format_file_path(left_path);
+            let right_ui_path = path_converter.format_file_path(right_path);
 
             match (&left_value, &right_value) {
-                (_, MaterializedTreeValue::AccessDenied(source))
-                | (MaterializedTreeValue::AccessDenied(source), _) => {
+                (_, MaterializedTreeValue::AccessDenied(source)) => {
                     write!(
                         formatter.labeled("access-denied"),
-                        "Access denied to {ui_path}:"
+                        "Access denied to {right_ui_path}:"
+                    )?;
+                    writeln!(formatter, " {source}")?;
+                    continue;
+                }
+                (MaterializedTreeValue::AccessDenied(source), _) => {
+                    write!(
+                        formatter.labeled("access-denied"),
+                        "Access denied to {left_ui_path}:"
                     )?;
                     writeln!(formatter, " {source}")?;
                     continue;
                 }
                 _ => {}
             }
-            let left_path = create_file(&path, &left_wc_dir, left_value)?;
-            let right_path = create_file(&path, &right_wc_dir, right_value)?;
+            let left_path = create_file(left_path, &left_wc_dir, left_value)?;
+            let right_path = create_file(right_path, &right_wc_dir, right_value)?;
 
             invoke_external_diff(
                 ui,
@@ -784,16 +1029,27 @@ fn git_diff_part(
             hash = id.hex();
             content = FileContent::empty();
         }
-        MaterializedTreeValue::Conflict {
+        MaterializedTreeValue::FileConflict {
             id: _,
             contents,
             executable,
         } => {
             mode = if executable { "100755" } else { "100644" };
             hash = DUMMY_HASH.to_owned();
+            let mut data = vec![];
+            materialize_merge_result(&contents, &mut data)
+                .expect("Failed to materialize conflict to in-memory buffer");
             content = FileContent {
                 is_binary: false, // TODO: are we sure this is never binary?
-                contents,
+                contents: data,
+            };
+        }
+        MaterializedTreeValue::OtherConflict { id } => {
+            mode = "100644";
+            hash = DUMMY_HASH.to_owned();
+            content = FileContent {
+                is_binary: false,
+                contents: id.describe().into_bytes(),
             };
         }
         MaterializedTreeValue::Tree(_) => {
@@ -898,8 +1154,8 @@ fn unified_diff_hunks<'content>(
                 current_hunk.extend_context_lines(before_lines.into_iter().rev());
             }
             DiffHunk::Different(contents) => {
-                let [left, right] = contents.try_into().unwrap();
-                let (left_lines, right_lines) = inline_diff_hunks(left, right);
+                let (left_lines, right_lines) =
+                    unzip_diff_hunks_to_lines(Diff::by_word(contents).hunks());
                 current_hunk.extend_removed_lines(left_lines);
                 current_hunk.extend_added_lines(right_lines);
             }
@@ -911,23 +1167,21 @@ fn unified_diff_hunks<'content>(
     hunks
 }
 
-/// Splits line-level hunks into word-level tokens. Returns lists of tokens per
-/// line.
-fn inline_diff_hunks<'content>(
-    left_content: &'content [u8],
-    right_content: &'content [u8],
-) -> (Vec<DiffTokenVec<'content>>, Vec<DiffTokenVec<'content>>) {
+/// Splits `(left, right)` hunk pairs into `(left_lines, right_lines)`.
+fn unzip_diff_hunks_to_lines<'content, I>(
+    diff_hunks: I,
+) -> (Vec<DiffTokenVec<'content>>, Vec<DiffTokenVec<'content>>)
+where
+    I: IntoIterator,
+    I::Item: Borrow<DiffHunk<'content>>,
+{
     let mut left_lines: Vec<DiffTokenVec<'content>> = vec![];
     let mut right_lines: Vec<DiffTokenVec<'content>> = vec![];
     let mut left_tokens: DiffTokenVec<'content> = vec![];
     let mut right_tokens: DiffTokenVec<'content> = vec![];
 
-    // Like Diff::default_refinement(), but doesn't try to match up contents by
-    // lines. We know left/right_contents have no matching lines.
-    let mut diff = Diff::for_tokenizer([left_content, right_content], diff::find_word_ranges);
-    diff.refine_changed_regions(diff::find_nonword_ranges);
-    for hunk in diff.hunks() {
-        match hunk {
+    for hunk in diff_hunks {
+        match hunk.borrow() {
             DiffHunk::Matching(content) => {
                 for token in content.split_inclusive(|b| *b == b'\n') {
                     left_tokens.push((DiffTokenType::Matching, token));
@@ -939,7 +1193,9 @@ fn inline_diff_hunks<'content>(
                 }
             }
             DiffHunk::Different(contents) => {
-                let [left, right] = contents.try_into().unwrap();
+                let [left, right] = contents[..]
+                    .try_into()
+                    .expect("hunk should have exactly two inputs");
                 for token in left.split_inclusive(|b| *b == b'\n') {
                     left_tokens.push((DiffTokenType::Different, token));
                     if token.ends_with(b"\n") {
@@ -988,14 +1244,7 @@ fn show_unified_diff_hunks(
             };
             formatter.with_label(label, |formatter| {
                 write!(formatter, "{sigil}")?;
-                for (token_type, content) in tokens {
-                    match token_type {
-                        DiffTokenType::Matching => formatter.write_all(content)?,
-                        DiffTokenType::Different => formatter
-                            .with_label("token", |formatter| formatter.write_all(content))?,
-                    }
-                }
-                io::Result::Ok(())
+                show_diff_line_tokens(formatter, tokens)
             })?;
             let (_, content) = tokens.last().expect("hunk line must not be empty");
             if !content.ends_with(b"\n") {
@@ -1006,21 +1255,44 @@ fn show_unified_diff_hunks(
     Ok(())
 }
 
+fn show_diff_line_tokens(
+    formatter: &mut dyn Formatter,
+    tokens: &[(DiffTokenType, &[u8])],
+) -> io::Result<()> {
+    for (token_type, content) in tokens {
+        match token_type {
+            DiffTokenType::Matching => formatter.write_all(content)?,
+            DiffTokenType::Different => {
+                formatter.with_label("token", |formatter| formatter.write_all(content))?
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn show_git_diff(
     formatter: &mut dyn Formatter,
     store: &Store,
-    tree_diff: TreeDiffStream,
+    tree_diff: BoxStream<CopiesTreeDiffEntry>,
     num_context_lines: usize,
 ) -> Result<(), DiffRenderError> {
     let mut diff_stream = materialized_diff_stream(store, tree_diff);
     async {
-        while let Some((path, diff)) = diff_stream.next().await {
-            let path_string = path.as_internal_file_string();
-            let (left_value, right_value) = diff?;
-            let left_part = git_diff_part(&path, left_value)?;
-            let right_part = git_diff_part(&path, right_value)?;
+        while let Some(MaterializedTreeDiffEntry { path, values }) = diff_stream.next().await {
+            let left_path = path.source();
+            let right_path = path.target();
+            let left_path_string = left_path.as_internal_file_string();
+            let right_path_string = right_path.as_internal_file_string();
+            let (left_value, right_value) = values?;
+
+            let left_part = git_diff_part(left_path, left_value)?;
+            let right_part = git_diff_part(right_path, right_value)?;
+
             formatter.with_label("file_header", |formatter| {
-                writeln!(formatter, "diff --git a/{path_string} b/{path_string}")?;
+                writeln!(
+                    formatter,
+                    "diff --git a/{left_path_string} b/{right_path_string}"
+                )?;
                 let left_hash = &left_part.hash;
                 let right_hash = &right_part.hash;
                 match (left_part.mode, right_part.mode) {
@@ -1033,6 +1305,15 @@ pub fn show_git_diff(
                         writeln!(formatter, "index {left_hash}..{right_hash}")?;
                     }
                     (Some(left_mode), Some(right_mode)) => {
+                        if let Some(op) = path.copy_operation() {
+                            let operation = match op {
+                                CopyOperation::Copy => "copy",
+                                CopyOperation::Rename => "rename",
+                            };
+                            // TODO: include similarity index?
+                            writeln!(formatter, "{operation} from {left_path_string}")?;
+                            writeln!(formatter, "{operation} to {right_path_string}")?;
+                        }
                         if left_mode != right_mode {
                             writeln!(formatter, "old mode {left_mode}")?;
                             writeln!(formatter, "new mode {right_mode}")?;
@@ -1045,7 +1326,7 @@ pub fn show_git_diff(
                     }
                     (None, None) => panic!("either left or right part should be present"),
                 }
-                io::Result::Ok(())
+                Ok::<(), DiffRenderError>(())
             })?;
 
             if left_part.content.contents == right_part.content.contents {
@@ -1053,11 +1334,11 @@ pub fn show_git_diff(
             }
 
             let left_path = match left_part.mode {
-                Some(_) => format!("a/{path_string}"),
+                Some(_) => format!("a/{left_path_string}"),
                 None => "/dev/null".to_owned(),
             };
             let right_path = match right_part.mode {
-                Some(_) => format!("b/{path_string}"),
+                Some(_) => format!("b/{right_path_string}"),
                 None => "/dev/null".to_owned(),
             };
             if left_part.content.is_binary || right_part.content.is_binary {
@@ -1088,20 +1369,29 @@ pub fn show_git_diff(
 #[instrument(skip_all)]
 pub fn show_diff_summary(
     formatter: &mut dyn Formatter,
-    mut tree_diff: TreeDiffStream,
+    mut tree_diff: BoxStream<CopiesTreeDiffEntry>,
     path_converter: &RepoPathUiConverter,
-) -> io::Result<()> {
+) -> Result<(), DiffRenderError> {
     async {
-        while let Some((repo_path, diff)) = tree_diff.next().await {
-            let (before, after) = diff.unwrap();
-            let ui_path = path_converter.format_file_path(&repo_path);
-            if before.is_present() && after.is_present() {
-                writeln!(formatter.labeled("modified"), "M {ui_path}")?;
-            } else if before.is_absent() {
-                writeln!(formatter.labeled("added"), "A {ui_path}")?;
+        while let Some(CopiesTreeDiffEntry { path, values }) = tree_diff.next().await {
+            let (before, after) = values?;
+            let before_path = path.source();
+            let after_path = path.target();
+            if let Some(op) = path.copy_operation() {
+                let (label, sigil) = match op {
+                    CopyOperation::Copy => ("copied", "C"),
+                    CopyOperation::Rename => ("renamed", "R"),
+                };
+                let path = path_converter.format_copied_path(before_path, after_path);
+                writeln!(formatter.labeled(label), "{sigil} {path}")?
             } else {
-                // `R` could be interpreted as "renamed"
-                writeln!(formatter.labeled("removed"), "D {ui_path}")?;
+                let path = path_converter.format_file_path(after_path);
+                match (before.is_present(), after.is_present()) {
+                    (true, true) => writeln!(formatter.labeled("modified"), "M {path}")?,
+                    (false, true) => writeln!(formatter.labeled("added"), "A {path}")?,
+                    (true, false) => writeln!(formatter.labeled("removed"), "D {path}")?,
+                    (false, false) => unreachable!(),
+                }
             }
         }
         Ok(())
@@ -1113,6 +1403,7 @@ struct DiffStat {
     path: String,
     added: usize,
     removed: usize,
+    is_deletion: bool,
 }
 
 fn get_diff_stat(
@@ -1140,27 +1431,38 @@ fn get_diff_stat(
         path,
         added,
         removed,
+        is_deletion: right_content.contents.is_empty(),
     }
 }
 
 pub fn show_diff_stat(
     formatter: &mut dyn Formatter,
     store: &Store,
-    tree_diff: TreeDiffStream,
+    tree_diff: BoxStream<CopiesTreeDiffEntry>,
     path_converter: &RepoPathUiConverter,
     display_width: usize,
 ) -> Result<(), DiffRenderError> {
     let mut stats: Vec<DiffStat> = vec![];
+    let mut unresolved_renames = HashSet::new();
     let mut max_path_width = 0;
     let mut max_diffs = 0;
 
     let mut diff_stream = materialized_diff_stream(store, tree_diff);
     async {
-        while let Some((repo_path, diff)) = diff_stream.next().await {
-            let (left, right) = diff?;
-            let path = path_converter.format_file_path(&repo_path);
-            let left_content = diff_content(&repo_path, left)?;
-            let right_content = diff_content(&repo_path, right)?;
+        while let Some(MaterializedTreeDiffEntry { path, values }) = diff_stream.next().await {
+            let (left, right) = values?;
+            let left_path = path.source();
+            let right_path = path.target();
+            let left_content = diff_content(left_path, left)?;
+            let right_content = diff_content(right_path, right)?;
+
+            let left_ui_path = path_converter.format_file_path(left_path);
+            let path = if left_path == right_path {
+                left_ui_path
+            } else {
+                unresolved_renames.insert(left_ui_path);
+                path_converter.format_copied_path(left_path, right_path)
+            };
             max_path_width = max(max_path_width, path.width());
             let stat = get_diff_stat(path, &left_content, &right_content);
             max_diffs = max(max_diffs, stat.added + stat.removed);
@@ -1185,10 +1487,15 @@ pub fn show_diff_stat(
 
     let mut total_added = 0;
     let mut total_removed = 0;
-    let total_files = stats.len();
+    let mut total_files = 0;
     for stat in &stats {
+        if stat.is_deletion && unresolved_renames.contains(&stat.path) {
+            continue;
+        }
+
         total_added += stat.added;
         total_removed += stat.removed;
+        total_files += 1;
         let bar_added = (stat.added as f64 * factor).ceil() as usize;
         let bar_removed = (stat.removed as f64 * factor).ceil() as usize;
         // replace start of path with ellipsis if the path is too long
@@ -1219,18 +1526,18 @@ pub fn show_diff_stat(
 
 pub fn show_types(
     formatter: &mut dyn Formatter,
-    mut tree_diff: TreeDiffStream,
+    mut tree_diff: BoxStream<CopiesTreeDiffEntry>,
     path_converter: &RepoPathUiConverter,
-) -> io::Result<()> {
+) -> Result<(), DiffRenderError> {
     async {
-        while let Some((repo_path, diff)) = tree_diff.next().await {
-            let (before, after) = diff.unwrap();
+        while let Some(CopiesTreeDiffEntry { path, values }) = tree_diff.next().await {
+            let (before, after) = values?;
             writeln!(
                 formatter.labeled("modified"),
                 "{}{} {}",
                 diff_summary_char(&before),
                 diff_summary_char(&after),
-                path_converter.format_file_path(&repo_path)
+                path_converter.format_copied_path(path.source(), path.target())
             )?;
         }
         Ok(())
@@ -1253,12 +1560,16 @@ fn diff_summary_char(value: &MergedTreeValue) -> char {
 
 pub fn show_names(
     formatter: &mut dyn Formatter,
-    mut tree_diff: TreeDiffStream,
+    mut tree_diff: BoxStream<CopiesTreeDiffEntry>,
     path_converter: &RepoPathUiConverter,
 ) -> io::Result<()> {
     async {
-        while let Some((repo_path, _)) = tree_diff.next().await {
-            writeln!(formatter, "{}", path_converter.format_file_path(&repo_path))?;
+        while let Some(CopiesTreeDiffEntry { path, .. }) = tree_diff.next().await {
+            writeln!(
+                formatter,
+                "{}",
+                path_converter.format_file_path(path.target())
+            )?;
         }
         Ok(())
     }

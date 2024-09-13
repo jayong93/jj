@@ -1,24 +1,39 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
-use std::process::{Command, ExitStatus, Stdio};
+use std::io;
+use std::io::Write;
+use std::process::Command;
+use std::process::ExitStatus;
+use std::process::Stdio;
 use std::sync::Arc;
 
+use bstr::BString;
 use itertools::Itertools;
-use jj_lib::backend::{FileId, MergedTreeId, TreeValue};
-use jj_lib::conflicts::{self, materialize_merge_result};
+use jj_lib::backend::FileId;
+use jj_lib::backend::MergedTreeId;
+use jj_lib::backend::TreeValue;
+use jj_lib::conflicts;
+use jj_lib::conflicts::materialize_merge_result;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::Matcher;
-use jj_lib::merge::{Merge, MergedTreeValue};
-use jj_lib::merged_tree::{MergedTree, MergedTreeBuilder};
+use jj_lib::merge::Merge;
+use jj_lib::merge::MergedTreeValue;
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree::MergedTreeBuilder;
 use jj_lib::repo_path::RepoPath;
 use pollster::FutureExt;
 use thiserror::Error;
 
-use super::diff_working_copies::{
-    check_out_trees, new_utf8_temp_dir, set_readonly_recursively, DiffEditWorkingCopies, DiffSide,
-};
-use super::{ConflictResolveError, DiffEditError, DiffGenerateError};
-use crate::config::{find_all_variables, interpolate_variables, CommandNameAndArgs};
+use super::diff_working_copies::check_out_trees;
+use super::diff_working_copies::new_utf8_temp_dir;
+use super::diff_working_copies::set_readonly_recursively;
+use super::diff_working_copies::DiffEditWorkingCopies;
+use super::diff_working_copies::DiffSide;
+use super::ConflictResolveError;
+use super::DiffEditError;
+use super::DiffGenerateError;
+use crate::config::find_all_variables;
+use crate::config::interpolate_variables;
+use crate::config::CommandNameAndArgs;
 use crate::ui::Ui;
 
 /// Merge/diff tool loaded from the settings.
@@ -137,7 +152,7 @@ pub enum ExternalToolError {
 pub fn run_mergetool_external(
     editor: &ExternalMergeTool,
     file_merge: Merge<Option<FileId>>,
-    content: Merge<jj_lib::files::ContentHunk>,
+    content: Merge<BString>,
     repo_path: &RepoPath,
     conflict: MergedTreeValue,
     tree: &MergedTree,
@@ -152,9 +167,9 @@ pub fn run_mergetool_external(
     };
     assert_eq!(content.num_sides(), 2);
     let files: HashMap<&str, &[u8]> = maplit::hashmap! {
-        "base" => content.get_remove(0).unwrap().0.as_slice(),
-        "left" => content.get_add(0).unwrap().0.as_slice(),
-        "right" => content.get_add(1).unwrap().0.as_slice(),
+        "base" => content.get_remove(0).unwrap().as_slice(),
+        "left" => content.get_add(0).unwrap().as_slice(),
+        "right" => content.get_add(1).unwrap().as_slice(),
         "output" => initial_output_content.as_slice(),
     };
 

@@ -17,14 +17,19 @@ use std::sync::Arc;
 use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::OpStoreError;
 use jj_lib::operation::Operation;
-use jj_lib::repo::{ReadonlyRepo, Repo};
+use jj_lib::repo::ReadonlyRepo;
+use jj_lib::repo::Repo;
 use tracing::instrument;
 
-use crate::cli_util::{
-    check_stale_working_copy, print_checkout_stats, short_commit_hash, CommandHelper,
-    WorkingCopyFreshness, WorkspaceCommandHelper,
-};
-use crate::command_error::{internal_error_with_message, user_error, CommandError};
+use crate::cli_util::check_stale_working_copy;
+use crate::cli_util::print_checkout_stats;
+use crate::cli_util::short_commit_hash;
+use crate::cli_util::CommandHelper;
+use crate::cli_util::WorkingCopyFreshness;
+use crate::cli_util::WorkspaceCommandHelper;
+use crate::command_error::internal_error_with_message;
+use crate::command_error::user_error;
+use crate::command_error::CommandError;
 use crate::ui::Ui;
 
 /// Update a workspace that has become stale
@@ -41,7 +46,7 @@ pub fn cmd_workspace_update_stale(
     _args: &WorkspaceUpdateStaleArgs,
 ) -> Result<(), CommandError> {
     // Snapshot the current working copy on top of the last known working-copy
-    // operation, then merge the concurrent operations. The wc_commit_id of the
+    // operation, then merge the divergent operations. The wc_commit_id of the
     // merged repo wouldn't change because the old one wins, but it's probably
     // fine if we picked the new wc_commit_id.
     let known_wc_commit = {

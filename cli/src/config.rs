@@ -13,20 +13,38 @@
 // limitations under the License.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env;
+use std::fmt;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+use std::slice;
 use std::str::FromStr;
-use std::{env, fmt, slice};
 
 use config::Source;
 use itertools::Itertools;
 use jj_lib::settings::ConfigResultExt as _;
-use regex::{Captures, Regex};
+use regex::Captures;
+use regex::Regex;
 use thiserror::Error;
 use tracing::instrument;
 
-use crate::command_error::{user_error, user_error_with_message, CommandError};
+use crate::command_error::user_error;
+use crate::command_error::user_error_with_message;
+use crate::command_error::CommandError;
+
+/// Parses a TOML value expression. Interprets the given value as string if it
+/// can't be parsed.
+pub fn parse_toml_value_or_bare_string(value_str: &str) -> toml_edit::Value {
+    match value_str.parse() {
+        Ok(value) => value,
+        // TODO: might be better to reject meta characters. A typo in TOML value
+        // expression shouldn't be silently converted to string.
+        _ => value_str.into(),
+    }
+}
 
 pub fn to_toml_value(value: &config::Value) -> Result<toml_edit::Value, config::ConfigError> {
     fn type_error<T: fmt::Display>(message: T) -> config::ConfigError {
@@ -566,7 +584,7 @@ fn read_config_path(config_path: &Path) -> Result<config::Config, config::Config
 
 pub fn write_config_value_to_file(
     key: &ConfigNamePathBuf,
-    value_str: &str,
+    value: toml_edit::Value,
     path: &Path,
 ) -> Result<(), CommandError> {
     // Read config
@@ -588,12 +606,6 @@ pub fn write_config_value_to_file(
     })?;
 
     // Apply config value
-    // Interpret value as string if it can't be parsed as a TOML value.
-    // TODO(#531): Infer types based on schema (w/ --type arg to override).
-    let item = match value_str.parse() {
-        Ok(value) => toml_edit::Item::Value(value),
-        _ => toml_edit::value(value_str),
-    };
     let mut target_table = doc.as_table_mut();
     let mut key_parts_iter = key.components();
     let last_key_part = key_parts_iter.next_back().expect("key must not be empty");
@@ -618,7 +630,7 @@ pub fn write_config_value_to_file(
             )));
         }
     }
-    target_table[last_key_part] = item;
+    target_table[last_key_part] = toml_edit::Item::Value(value);
 
     // Write config back
     std::fs::write(path, doc.to_string()).map_err(|err| {

@@ -14,7 +14,9 @@
 
 use jj_lib::secret_backend::SecretBackend;
 
-use crate::common::{get_stderr_string, get_stdout_string, TestEnvironment};
+use crate::common::get_stderr_string;
+use crate::common::get_stdout_string;
+use crate::common::TestEnvironment;
 
 #[test]
 fn test_diff() {
@@ -52,7 +54,7 @@ fn test_diff() {
     let stdout = test_env.jj_cmd_success(&repo_path, &["diff", "--summary"]);
     insta::assert_snapshot!(stdout.replace('\\', "/"), @r###"
     M a-first
-    A added-secret
+    C {a-first => added-secret}
     D deleted-secret
     M dir/secret
     M modified-secret
@@ -61,7 +63,7 @@ fn test_diff() {
     let stdout = test_env.jj_cmd_success(&repo_path, &["diff", "--types"]);
     insta::assert_snapshot!(stdout.replace('\\', "/"), @r###"
     FF a-first
-    -F added-secret
+    FF {a-first => added-secret}
     F- deleted-secret
     FF dir/secret
     FF modified-secret
@@ -69,13 +71,13 @@ fn test_diff() {
     "###);
     let stdout = test_env.jj_cmd_success(&repo_path, &["diff", "--stat"]);
     insta::assert_snapshot!(stdout.replace('\\', "/"), @r###"
-    a-first         | 2 +-
-    added-secret    | 1 +
-    deleted-secret  | 1 -
-    dir/secret      | 0
-    modified-secret | 0
-    z-last          | 2 +-
-    6 files changed, 3 insertions(+), 3 deletions(-)
+    a-first                   | 2 +-
+    {a-first => added-secret} | 2 +-
+    deleted-secret            | 1 -
+    dir/secret                | 0
+    modified-secret           | 0
+    z-last                    | 2 +-
+    6 files changed, 3 insertions(+), 4 deletions(-)
     "###);
     let assert = test_env
         .jj_cmd(&repo_path, &["diff", "--git"])

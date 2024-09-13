@@ -15,25 +15,34 @@
 #![allow(missing_docs)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::default::Default;
+use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
-use std::{fmt, str};
+use std::str;
 
 use git2::Oid;
 use itertools::Itertools;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::backend::{BackendError, CommitId};
+use crate::backend::BackendError;
+use crate::backend::CommitId;
 use crate::commit::Commit;
 use crate::git_backend::GitBackend;
 use crate::index::Index;
 use crate::object_id::ObjectId;
-use crate::op_store::{RefTarget, RefTargetOptionExt, RemoteRef, RemoteRefState};
-use crate::refs::{self, BranchPushUpdate};
-use crate::repo::{MutableRepo, Repo};
+use crate::op_store::RefTarget;
+use crate::op_store::RefTargetOptionExt;
+use crate::op_store::RemoteRef;
+use crate::op_store::RemoteRefState;
+use crate::refs;
+use crate::refs::BranchPushUpdate;
+use crate::repo::MutableRepo;
+use crate::repo::Repo;
 use crate::revset::RevsetExpression;
 use crate::settings::GitSettings;
 use crate::store::Store;
@@ -153,7 +162,7 @@ fn resolve_git_ref_to_commit_id(
                 }
                 // Unknown id. Recurse from the current state. A tag may point to
                 // non-commit object.
-                peeling_ref.to_mut().inner.target = gix::refs::Target::Peeled(oid.detach());
+                peeling_ref.to_mut().inner.target = gix::refs::Target::Object(oid.detach());
             }
         }
     }
@@ -671,9 +680,13 @@ pub fn export_some_refs(
             let old_target = head_ref.inner.target.clone();
             let current_oid = match head_ref.into_fully_peeled_id() {
                 Ok(id) => Some(id.detach()),
-                Err(gix::reference::peel::Error::ToId(gix::refs::peel::to_id::Error::Follow(
-                    gix::refs::file::find::existing::Error::NotFound { .. },
-                ))) => None, // Unborn ref should be considered absent
+                Err(gix::reference::peel::Error::ToId(
+                    gix::refs::peel::to_id::Error::FollowToObject(
+                        gix::refs::peel::to_object::Error::Follow(
+                            gix::refs::file::find::existing::Error::NotFound { .. },
+                        ),
+                    ),
+                )) => None, // Unborn ref should be considered absent
                 Err(err) => return Err(GitExportError::from_git(err)),
             };
             let new_oid = if let Some((_old_oid, new_oid)) = branches_to_update.get(&parsed_ref) {
@@ -928,7 +941,7 @@ fn update_git_head(
 ) -> Result<(), GitExportError> {
     let mut ref_edits = Vec::new();
     let new_target = if let Some(oid) = new_oid {
-        gix::refs::Target::Peeled(oid)
+        gix::refs::Target::Object(oid)
     } else {
         // Can't detach HEAD without a commit. Use placeholder ref to nullify
         // the HEAD. The placeholder ref isn't a normal branch ref. Git CLI

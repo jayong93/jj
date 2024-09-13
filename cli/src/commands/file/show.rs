@@ -12,21 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{self, Write};
+use std::io;
+use std::io::Write;
 
 use jj_lib::backend::BackendResult;
-use jj_lib::conflicts::{materialize_tree_value, MaterializedTreeValue};
-use jj_lib::fileset::{FilePattern, FilesetExpression};
+use jj_lib::conflicts::materialize_merge_result;
+use jj_lib::conflicts::materialize_tree_value;
+use jj_lib::conflicts::MaterializedTreeValue;
+use jj_lib::fileset::FilePattern;
+use jj_lib::fileset::FilesetExpression;
 use jj_lib::merge::MergedTreeValue;
 use jj_lib::repo::Repo;
 use jj_lib::repo_path::RepoPath;
 use pollster::FutureExt;
 use tracing::instrument;
 
-use crate::cli_util::{
-    print_unmatched_explicit_paths, CommandHelper, RevisionArg, WorkspaceCommandHelper,
-};
-use crate::command_error::{user_error, CommandError};
+use crate::cli_util::print_unmatched_explicit_paths;
+use crate::cli_util::CommandHelper;
+use crate::cli_util::RevisionArg;
+use crate::cli_util::WorkspaceCommandHelper;
+use crate::command_error::user_error;
+use crate::command_error::CommandError;
 use crate::ui::Ui;
 
 /// Print contents of files in a revision
@@ -41,23 +47,6 @@ pub(crate) struct FileShowArgs {
     /// Paths to print
     #[arg(required = true, value_hint = clap::ValueHint::FilePath)]
     paths: Vec<String>,
-}
-
-#[instrument(skip_all)]
-pub(crate) fn deprecated_cmd_cat(
-    ui: &mut Ui,
-    command: &CommandHelper,
-    args: &FileShowArgs,
-) -> Result<(), CommandError> {
-    writeln!(
-        ui.warning_default(),
-        "`jj cat` is deprecated; use `jj file show` instead, which is equivalent"
-    )?;
-    writeln!(
-        ui.warning_default(),
-        "`jj cat` will be removed in a future version, and this will be a hard error"
-    )?;
-    cmd_file_show(ui, command, args)
 }
 
 #[instrument(skip_all)]
@@ -131,8 +120,11 @@ fn write_tree_entries<P: AsRef<RepoPath>>(
             MaterializedTreeValue::File { mut reader, .. } => {
                 io::copy(&mut reader, &mut ui.stdout_formatter().as_mut())?;
             }
-            MaterializedTreeValue::Conflict { contents, .. } => {
-                ui.stdout_formatter().write_all(&contents)?;
+            MaterializedTreeValue::FileConflict { contents, .. } => {
+                materialize_merge_result(&contents, &mut ui.stdout_formatter())?;
+            }
+            MaterializedTreeValue::OtherConflict { id } => {
+                ui.stdout_formatter().write_all(id.describe().as_bytes())?;
             }
             MaterializedTreeValue::Symlink { .. } | MaterializedTreeValue::GitSubmodule(_) => {
                 let ui_path = workspace_command.format_file_path(path.as_ref());

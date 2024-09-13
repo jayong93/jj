@@ -12,23 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+use std::time::SystemTime;
 
 use futures::executor::block_on_stream;
-use jj_lib::backend::{CommitId, CopySource, CopySources};
+use jj_lib::backend::CommitId;
+use jj_lib::backend::CopyRecord;
 use jj_lib::commit::Commit;
 use jj_lib::git_backend::GitBackend;
-use jj_lib::repo::{ReadonlyRepo, Repo};
-use jj_lib::repo_path::{RepoPath, RepoPathBuf};
+use jj_lib::repo::ReadonlyRepo;
+use jj_lib::repo::Repo;
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
 use maplit::hashset;
-use testutils::{create_random_commit, create_tree, CommitGraphBuilder, TestRepo, TestRepoBackend};
+use testutils::create_random_commit;
+use testutils::create_tree;
+use testutils::CommitGraphBuilder;
+use testutils::TestRepo;
+use testutils::TestRepoBackend;
 
 fn get_git_backend(repo: &Arc<ReadonlyRepo>) -> &GitBackend {
     repo.store()
@@ -51,26 +60,16 @@ fn collect_no_gc_refs(git_repo_path: &Path) -> HashSet<CommitId> {
 
 fn get_copy_records(
     store: &Store,
-    paths: &[RepoPathBuf],
+    paths: Option<&[RepoPathBuf]>,
     a: &Commit,
     b: &Commit,
-) -> HashMap<String, Vec<String>> {
-    let stream = store
-        .get_copy_records(paths, &[a.id().clone()], &[b.id().clone()])
-        .unwrap();
-    let mut res: HashMap<String, Vec<String>> = HashMap::new();
-    for copy_record in block_on_stream(stream).map(|r| r.unwrap()) {
+) -> HashMap<String, String> {
+    let stream = store.get_copy_records(paths, a.id(), b.id()).unwrap();
+    let mut res: HashMap<String, String> = HashMap::new();
+    for CopyRecord { target, source, .. } in block_on_stream(stream).filter_map(|r| r.ok()) {
         res.insert(
-            copy_record.target.as_internal_file_string().into(),
-            match copy_record.sources {
-                CopySources::Resolved(CopySource { path, .. }) => {
-                    vec![path.as_internal_file_string().into()]
-                }
-                CopySources::Conflict(conflicting) => conflicting
-                    .iter()
-                    .map(|s| s.path.as_internal_file_string().into())
-                    .collect(),
-            },
+            target.as_internal_file_string().into(),
+            source.as_internal_file_string().into(),
         );
     }
     res
@@ -272,23 +271,27 @@ fn test_copy_detection() {
 
     let store = repo.store();
     assert_eq!(
-        get_copy_records(store, paths, &commit_a, &commit_b),
-        HashMap::from([("file1".to_string(), vec!["file0".to_string()])])
+        get_copy_records(store, Some(paths), &commit_a, &commit_b),
+        HashMap::from([("file1".to_string(), "file0".to_string())])
     );
     assert_eq!(
-        get_copy_records(store, paths, &commit_b, &commit_c),
-        HashMap::from([("file2".to_string(), vec!["file1".to_string()])])
+        get_copy_records(store, Some(paths), &commit_b, &commit_c),
+        HashMap::from([("file2".to_string(), "file1".to_string())])
     );
     assert_eq!(
-        get_copy_records(store, paths, &commit_a, &commit_c),
-        HashMap::from([("file2".to_string(), vec!["file0".to_string()])])
+        get_copy_records(store, Some(paths), &commit_a, &commit_c),
+        HashMap::from([("file2".to_string(), "file0".to_string())])
     );
     assert_eq!(
-        get_copy_records(store, &[], &commit_a, &commit_c),
+        get_copy_records(store, None, &commit_a, &commit_c),
+        HashMap::from([("file2".to_string(), "file0".to_string())])
+    );
+    assert_eq!(
+        get_copy_records(store, Some(&[paths[1].clone()]), &commit_a, &commit_c),
         HashMap::default(),
     );
     assert_eq!(
-        get_copy_records(store, paths, &commit_c, &commit_c),
+        get_copy_records(store, Some(paths), &commit_c, &commit_c),
         HashMap::default(),
     );
 }

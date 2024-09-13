@@ -13,28 +13,39 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use jj_cli::cli_util::{CliRunner, CommandHelper};
+use jj_cli::cli_util::CliRunner;
+use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::CommandError;
 use jj_cli::ui::Ui;
-use jj_lib::backend::{Backend, MergedTreeId};
+use jj_lib::backend::Backend;
+use jj_lib::backend::MergedTreeId;
 use jj_lib::commit::Commit;
 use jj_lib::git_backend::GitBackend;
 use jj_lib::local_working_copy::LocalWorkingCopy;
-use jj_lib::op_store::{OperationId, WorkspaceId};
+use jj_lib::op_store::OperationId;
+use jj_lib::op_store::WorkspaceId;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::settings::UserSettings;
 use jj_lib::signing::Signer;
 use jj_lib::store::Store;
-use jj_lib::working_copy::{
-    CheckoutError, CheckoutStats, LockedWorkingCopy, ResetError, SnapshotError, SnapshotOptions,
-    WorkingCopy, WorkingCopyFactory, WorkingCopyStateError,
-};
-use jj_lib::workspace::{WorkingCopyFactories, Workspace, WorkspaceInitError};
+use jj_lib::working_copy::CheckoutError;
+use jj_lib::working_copy::CheckoutStats;
+use jj_lib::working_copy::LockedWorkingCopy;
+use jj_lib::working_copy::ResetError;
+use jj_lib::working_copy::SnapshotError;
+use jj_lib::working_copy::SnapshotOptions;
+use jj_lib::working_copy::WorkingCopy;
+use jj_lib::working_copy::WorkingCopyFactory;
+use jj_lib::working_copy::WorkingCopyStateError;
+use jj_lib::workspace::WorkingCopyFactories;
+use jj_lib::workspace::Workspace;
+use jj_lib::workspace::WorkspaceInitError;
 
 #[derive(clap::Parser, Clone, Debug)]
 enum CustomCommand {
@@ -94,6 +105,7 @@ fn main() -> std::process::ExitCode {
 /// file to the working copy.
 struct ConflictsWorkingCopy {
     inner: Box<dyn WorkingCopy>,
+    working_copy_path: PathBuf,
 }
 
 impl ConflictsWorkingCopy {
@@ -110,20 +122,22 @@ impl ConflictsWorkingCopy {
     ) -> Result<Self, WorkingCopyStateError> {
         let inner = LocalWorkingCopy::init(
             store,
-            working_copy_path,
+            working_copy_path.clone(),
             state_path,
             operation_id,
             workspace_id,
         )?;
         Ok(ConflictsWorkingCopy {
             inner: Box::new(inner),
+            working_copy_path,
         })
     }
 
     fn load(store: Arc<Store>, working_copy_path: PathBuf, state_path: PathBuf) -> Self {
-        let inner = LocalWorkingCopy::load(store, working_copy_path, state_path);
+        let inner = LocalWorkingCopy::load(store, working_copy_path.clone(), state_path);
         ConflictsWorkingCopy {
             inner: Box::new(inner),
+            working_copy_path,
         }
     }
 }
@@ -135,10 +149,6 @@ impl WorkingCopy for ConflictsWorkingCopy {
 
     fn name(&self) -> &str {
         Self::name()
-    }
-
-    fn path(&self) -> &Path {
-        self.inner.path()
     }
 
     fn workspace_id(&self) -> &WorkspaceId {
@@ -160,7 +170,7 @@ impl WorkingCopy for ConflictsWorkingCopy {
     fn start_mutation(&self) -> Result<Box<dyn LockedWorkingCopy>, WorkingCopyStateError> {
         let inner = self.inner.start_mutation()?;
         Ok(Box::new(LockedConflictsWorkingCopy {
-            wc_path: self.inner.path().to_owned(),
+            wc_path: self.working_copy_path.clone(),
             inner,
         }))
     }
@@ -261,6 +271,9 @@ impl LockedWorkingCopy for LockedConflictsWorkingCopy {
         operation_id: OperationId,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
         let inner = self.inner.finish(operation_id)?;
-        Ok(Box::new(ConflictsWorkingCopy { inner }))
+        Ok(Box::new(ConflictsWorkingCopy {
+            inner,
+            working_copy_path: self.wc_path,
+        }))
     }
 }

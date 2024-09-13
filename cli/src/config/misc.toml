@@ -5,8 +5,8 @@ amend = ["squash"]
 co = ["checkout"]
 unamend = ["unsquash"]
 
-[format]
-tree-level-conflicts = true
+[diff.color-words]
+max-inline-alternation = 3
 
 [ui]
 # TODO: delete ui.allow-filesets in jj 0.26+
@@ -17,6 +17,9 @@ paginate = "auto"
 pager = { command = ["less", "-FRX"], env = { LESSCHARSET = "utf-8" } }
 log-word-wrap = false
 log-synthetic-elided-nodes = true
+
+[ui.movement]
+edit = false
 
 [snapshot]
 max-new-file-size = "1MiB"

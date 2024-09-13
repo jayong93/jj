@@ -14,10 +14,14 @@
 
 #![allow(missing_docs)]
 
-use std::cmp::{max, min, Ordering};
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::max;
+use std::cmp::min;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::iter;
 use std::ops::Range;
-use std::{iter, slice};
+use std::slice;
 
 use bstr::BStr;
 use itertools::Itertools;
@@ -416,11 +420,20 @@ impl<'input> Diff<'input> {
         let base_input = inputs.next().expect("inputs must not be empty");
         let other_inputs = inputs.collect_vec();
         // First tokenize each input
-        let base_token_ranges = tokenizer(base_input);
-        let other_token_ranges = other_inputs
-            .iter()
-            .map(|other_input| tokenizer(other_input))
-            .collect_vec();
+        let base_token_ranges: Vec<Range<usize>>;
+        let other_token_ranges: Vec<Vec<Range<usize>>>;
+        // No need to tokenize if one of the inputs is empty. Non-empty inputs
+        // are all different.
+        if base_input.is_empty() || other_inputs.iter().any(|input| input.is_empty()) {
+            base_token_ranges = vec![];
+            other_token_ranges = iter::repeat(vec![]).take(other_inputs.len()).collect();
+        } else {
+            base_token_ranges = tokenizer(base_input);
+            other_token_ranges = other_inputs
+                .iter()
+                .map(|other_input| tokenizer(other_input))
+                .collect();
+        }
         Self::with_inputs_and_token_ranges(
             base_input,
             other_inputs,
@@ -484,17 +497,14 @@ impl<'input> Diff<'input> {
         Diff::for_tokenizer(inputs, find_line_ranges)
     }
 
-    // TODO: At least when merging, it's wasteful to refine the diff if e.g. if 2
-    // out of 3 inputs match in the differing regions. Perhaps the refine()
-    // method should be on the hunk instead (probably returning a new Diff)?
-    // That would let each user decide which hunks to refine. However, it would
-    // probably mean that many callers repeat the same code. Perhaps it
-    // should be possible to refine a whole diff *or* individual hunks.
-    pub fn default_refinement<T: AsRef<[u8]> + ?Sized + 'input>(
+    /// Compares `inputs` word by word.
+    ///
+    /// The `inputs` is usually a changed hunk (e.g. a `DiffHunk::Different`)
+    /// that was the output from a line-by-line diff.
+    pub fn by_word<T: AsRef<[u8]> + ?Sized + 'input>(
         inputs: impl IntoIterator<Item = &'input T>,
     ) -> Self {
-        let mut diff = Diff::for_tokenizer(inputs, find_line_ranges);
-        diff.refine_changed_regions(find_word_ranges);
+        let mut diff = Diff::for_tokenizer(inputs, find_word_ranges);
         diff.refine_changed_regions(find_nonword_ranges);
         diff
     }
@@ -645,25 +655,18 @@ impl<'diff, 'input> Iterator for DiffHunkIterator<'diff, 'input> {
     }
 }
 
-/// Diffs two slices of bytes. The returned diff hunks may be any length (may
+/// Diffs slices of bytes. The returned diff hunks may be any length (may
 /// span many lines or may be only part of a line). This currently uses
 /// Histogram diff (or maybe something similar; I'm not sure I understood the
 /// algorithm correctly). It first diffs lines in the input and then refines
 /// the changed ranges at the word level.
-pub fn diff<'a>(left: &'a [u8], right: &'a [u8]) -> Vec<DiffHunk<'a>> {
-    if left == right {
-        return vec![DiffHunk::matching(left)];
-    }
-    if left.is_empty() {
-        return vec![DiffHunk::different([b"", right])];
-    }
-    if right.is_empty() {
-        return vec![DiffHunk::different([left, b""])];
-    }
-
-    Diff::default_refinement([left, right])
-        .hunks()
-        .collect_vec()
+pub fn diff<'a, T: AsRef<[u8]> + ?Sized + 'a>(
+    inputs: impl IntoIterator<Item = &'a T>,
+) -> Vec<DiffHunk<'a>> {
+    let mut diff = Diff::for_tokenizer(inputs, find_line_ranges);
+    diff.refine_changed_regions(find_word_ranges);
+    diff.refine_changed_regions(find_nonword_ranges);
+    diff.hunks().collect()
 }
 
 #[cfg(test)]
@@ -965,21 +968,45 @@ mod tests {
 
     #[test]
     fn test_diff_single_input() {
-        let diff = Diff::default_refinement(["abc"]);
-        assert_eq!(diff.hunks().collect_vec(), vec![DiffHunk::matching("abc")]);
+        assert_eq!(diff(["abc"]), vec![DiffHunk::matching("abc")]);
     }
 
     #[test]
-    fn test_diff_single_empty_input() {
-        let diff = Diff::default_refinement([""]);
-        assert_eq!(diff.hunks().collect_vec(), vec![]);
+    fn test_diff_some_empty_inputs() {
+        // All empty
+        assert_eq!(diff([""]), vec![]);
+        assert_eq!(diff(["", ""]), vec![]);
+        assert_eq!(diff(["", "", ""]), vec![]);
+
+        // One empty
+        assert_eq!(diff(["a b", ""]), vec![DiffHunk::different(["a b", ""])]);
+        assert_eq!(diff(["", "a b"]), vec![DiffHunk::different(["", "a b"])]);
+
+        // One empty, two match
+        assert_eq!(
+            diff(["a b", "", "a b"]),
+            vec![DiffHunk::different(["a b", "", "a b"])]
+        );
+        assert_eq!(
+            diff(["", "a b", "a b"]),
+            vec![DiffHunk::different(["", "a b", "a b"])]
+        );
+
+        // Two empty, one differs
+        assert_eq!(
+            diff(["a b", "", ""]),
+            vec![DiffHunk::different(["a b", "", ""])]
+        );
+        assert_eq!(
+            diff(["", "a b", ""]),
+            vec![DiffHunk::different(["", "a b", ""])]
+        );
     }
 
     #[test]
     fn test_diff_two_inputs_one_different() {
-        let diff = Diff::default_refinement(["a b c", "a X c"]);
         assert_eq!(
-            diff.hunks().collect_vec(),
+            diff(["a b c", "a X c"]),
             vec![
                 DiffHunk::matching("a "),
                 DiffHunk::different(["b", "X"]),
@@ -990,9 +1017,8 @@ mod tests {
 
     #[test]
     fn test_diff_multiple_inputs_one_different() {
-        let diff = Diff::default_refinement(["a b c", "a X c", "a b c"]);
         assert_eq!(
-            diff.hunks().collect_vec(),
+            diff(["a b c", "a X c", "a b c"]),
             vec![
                 DiffHunk::matching("a "),
                 DiffHunk::different(["b", "X", "b"]),
@@ -1003,9 +1029,8 @@ mod tests {
 
     #[test]
     fn test_diff_multiple_inputs_all_different() {
-        let diff = Diff::default_refinement(["a b c", "a X c", "a c X"]);
         assert_eq!(
-            diff.hunks().collect_vec(),
+            diff(["a b c", "a X c", "a c X"]),
             vec![
                 DiffHunk::matching("a "),
                 DiffHunk::different(["b ", "X ", ""]),
@@ -1035,7 +1060,7 @@ mod tests {
     #[test]
     fn test_diff_nothing_in_common() {
         assert_eq!(
-            diff(b"aaa", b"bb"),
+            diff(["aaa", "bb"]),
             vec![DiffHunk::different(["aaa", "bb"])]
         );
     }
@@ -1043,7 +1068,7 @@ mod tests {
     #[test]
     fn test_diff_insert_in_middle() {
         assert_eq!(
-            diff(b"a z", b"a S z"),
+            diff(["a z", "a S z"]),
             vec![
                 DiffHunk::matching("a "),
                 DiffHunk::different(["", "S "]),
@@ -1055,7 +1080,7 @@ mod tests {
     #[test]
     fn test_diff_no_unique_middle_flips() {
         assert_eq!(
-            diff(b"a R R S S z", b"a S S R R z"),
+            diff(["a R R S S z", "a S S R R z"]),
             vec![
                 DiffHunk::matching("a "),
                 DiffHunk::different(["R R ", ""]),
@@ -1069,10 +1094,10 @@ mod tests {
     #[test]
     fn test_diff_recursion_needed() {
         assert_eq!(
-            diff(
-                b"a q x q y q z q b q y q x q c",
-                b"a r r x q y z q b y q x r r c",
-            ),
+            diff([
+                "a q x q y q z q b q y q x q c",
+                "a r r x q y z q b y q x r r c",
+            ]),
             vec![
                 DiffHunk::matching("a "),
                 DiffHunk::different(["q", "r"]),
@@ -1098,10 +1123,12 @@ mod tests {
         // and "formatter", the region at the end has the unique words "write_fmt"
         // and "fmt", but we forgot to recurse into that region, so we ended up
         // saying that "write_fmt(fmt).unwrap()" was replaced by b"write_fmt(fmt)".
-        assert_eq!(diff(
-                b"    pub fn write_fmt(&mut self, fmt: fmt::Arguments<\'_>) {\n        self.styler().write_fmt(fmt).unwrap()\n",
-                b"    pub fn write_fmt(&mut self, fmt: fmt::Arguments<\'_>) -> io::Result<()> {\n        self.styler().write_fmt(fmt)\n"
-            ),
+        #[rustfmt::skip]
+        assert_eq!(
+            diff([
+                "    pub fn write_fmt(&mut self, fmt: fmt::Arguments<\'_>) {\n        self.styler().write_fmt(fmt).unwrap()\n",
+                "    pub fn write_fmt(&mut self, fmt: fmt::Arguments<\'_>) -> io::Result<()> {\n        self.styler().write_fmt(fmt)\n"
+            ]),
             vec![
                 DiffHunk::matching("    pub fn write_fmt(&mut self, fmt: fmt::Arguments<\'_>) "),
                 DiffHunk::different(["", "-> io::Result<()> "]),
@@ -1117,8 +1144,8 @@ mod tests {
         // This is the diff from commit e497ea2a9b in the git.git repo
         #[rustfmt::skip]
         assert_eq!(
-            diff(
-                br##"/*
+            diff([
+                r##"/*
  * GIT - The information manager from hell
  *
  * Copyright (C) Linus Torvalds, 2005
@@ -1167,7 +1194,7 @@ int main(int argc, char **argv)
 	return 0;
 }
 "##,
-                br##"/*
+                r##"/*
  * GIT - The information manager from hell
  *
  * Copyright (C) Linus Torvalds, 2005
@@ -1256,7 +1283,7 @@ int main(int argc, char **argv)
 	return 0;
 }
 "##,
-            ),
+            ]),
             vec![
                DiffHunk::matching("/*\n * GIT - The information manager from hell\n *\n * Copyright (C) Linus Torvalds, 2005\n */\n#include \"#cache.h\"\n\n"),
                DiffHunk::different(["", "static void create_directories(const char *path)\n{\n\tint len = strlen(path);\n\tchar *buf = malloc(len + 1);\n\tconst char *slash = path;\n\n\twhile ((slash = strchr(slash+1, \'/\')) != NULL) {\n\t\tlen = slash - path;\n\t\tmemcpy(buf, path, len);\n\t\tbuf[len] = 0;\n\t\tmkdir(buf, 0700);\n\t}\n}\n\nstatic int create_file(const char *path)\n{\n\tint fd = open(path, O_WRONLY | O_TRUNC | O_CREAT, 0600);\n\tif (fd < 0) {\n\t\tif (errno == ENOENT) {\n\t\t\tcreate_directories(path);\n\t\t\tfd = open(path, O_WRONLY | O_TRUNC | O_CREAT, 0600);\n\t\t}\n\t}\n\treturn fd;\n}\n\n"]),

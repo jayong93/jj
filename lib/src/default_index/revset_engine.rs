@@ -15,33 +15,54 @@
 #![allow(missing_docs)]
 
 use std::cell::RefCell;
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeSet, BinaryHeap, HashSet};
+use std::cmp::Ordering;
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
+use std::collections::BinaryHeap;
+use std::collections::HashSet;
+use std::fmt;
+use std::iter;
 use std::ops::Range;
 use std::rc::Rc;
+use std::str;
 use std::sync::Arc;
-use std::{fmt, iter, str};
 
 use futures::StreamExt as _;
 use itertools::Itertools;
 use pollster::FutureExt as _;
 
-use super::rev_walk::{EagerRevWalk, PeekableRevWalk, RevWalk, RevWalkBuilder};
+use super::rev_walk::EagerRevWalk;
+use super::rev_walk::PeekableRevWalk;
+use super::rev_walk::RevWalk;
+use super::rev_walk::RevWalkBuilder;
 use super::revset_graph_iterator::RevsetGraphWalk;
-use crate::backend::{BackendError, BackendResult, ChangeId, CommitId, MillisSinceEpoch};
+use crate::backend::BackendError;
+use crate::backend::BackendResult;
+use crate::backend::ChangeId;
+use crate::backend::CommitId;
+use crate::backend::MillisSinceEpoch;
 use crate::commit::Commit;
-use crate::conflicts::{materialized_diff_stream, MaterializedTreeValue};
-use crate::default_index::{AsCompositeIndex, CompositeIndex, IndexPosition};
+use crate::conflicts::materialize_merge_result;
+use crate::conflicts::materialize_tree_value;
+use crate::conflicts::MaterializedTreeValue;
+use crate::default_index::AsCompositeIndex;
+use crate::default_index::CompositeIndex;
+use crate::default_index::IndexPosition;
 use crate::graph::GraphEdge;
-use crate::matchers::{Matcher, Visit};
+use crate::matchers::Matcher;
+use crate::matchers::Visit;
+use crate::merged_tree::resolve_file_values;
 use crate::repo_path::RepoPath;
-use crate::revset::{
-    ResolvedExpression, ResolvedPredicateExpression, Revset, RevsetEvaluationError,
-    RevsetFilterPredicate, GENERATION_RANGE_FULL,
-};
+use crate::revset::ResolvedExpression;
+use crate::revset::ResolvedPredicateExpression;
+use crate::revset::Revset;
+use crate::revset::RevsetEvaluationError;
+use crate::revset::RevsetFilterPredicate;
+use crate::revset::GENERATION_RANGE_FULL;
+use crate::rewrite;
 use crate::store::Store;
 use crate::str_util::StringPattern;
-use crate::{rewrite, union_find};
+use crate::union_find;
 
 type BoxedPredicateFn<'a> = Box<dyn FnMut(&CompositeIndex, IndexPosition) -> bool + 'a>;
 pub(super) type BoxedRevWalk<'a> = Box<dyn RevWalk<CompositeIndex, Item = IndexPosition> + 'a>;
@@ -1142,9 +1163,24 @@ fn has_diff_from_parent(
             return Ok(false);
         }
     }
-    let from_tree = rewrite::merge_commit_trees_without_repo(store, &index, &parents)?;
+
+    // Conflict resolution is expensive, try that only for matched files.
+    let from_tree = rewrite::merge_commit_trees_no_resolve_without_repo(store, &index, &parents)?;
     let to_tree = commit.tree()?;
-    Ok(from_tree.diff(&to_tree, matcher).next().is_some())
+    // TODO: handle copy tracking
+    let mut tree_diff = from_tree.diff_stream(&to_tree, matcher);
+    async {
+        while let Some(entry) = tree_diff.next().await {
+            let (from_value, to_value) = entry.values?;
+            let from_value = resolve_file_values(store, &entry.path, from_value)?;
+            if from_value == to_value {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    .block_on()
 }
 
 fn matches_diff_from_parent(
@@ -1155,17 +1191,25 @@ fn matches_diff_from_parent(
     files_matcher: &dyn Matcher,
 ) -> BackendResult<bool> {
     let parents: Vec<_> = commit.parents().try_collect()?;
-    let from_tree = rewrite::merge_commit_trees_without_repo(store, &index, &parents)?;
+    // Conflict resolution is expensive, try that only for matched files.
+    let from_tree = rewrite::merge_commit_trees_no_resolve_without_repo(store, &index, &parents)?;
     let to_tree = commit.tree()?;
-    let tree_diff = from_tree.diff_stream(&to_tree, files_matcher);
-    // Conflicts are compared in materialized form. Alternatively, conflict
-    // pairs can be compared one by one. #4062
-    let mut diff_stream = materialized_diff_stream(store, tree_diff);
+    // TODO: handle copy tracking
+    let mut tree_diff = from_tree.diff_stream(&to_tree, files_matcher);
     async {
-        while let Some((path, diff)) = diff_stream.next().await {
-            let (left_value, right_value) = diff?;
-            let left_content = to_file_content(&path, left_value)?;
-            let right_content = to_file_content(&path, right_value)?;
+        while let Some(entry) = tree_diff.next().await {
+            let (left_value, right_value) = entry.values?;
+            let left_value = resolve_file_values(store, &entry.path, left_value)?;
+            if left_value == right_value {
+                continue;
+            }
+            // Conflicts are compared in materialized form. Alternatively,
+            // conflict pairs can be compared one by one. #4062
+            let left_future = materialize_tree_value(store, &entry.path, left_value);
+            let right_future = materialize_tree_value(store, &entry.path, right_value);
+            let (left_value, right_value) = futures::try_join!(left_future, right_future)?;
+            let left_content = to_file_content(&entry.path, left_value)?;
+            let right_content = to_file_content(&entry.path, right_value)?;
             // Filter lines prior to comparison. This might produce inferior
             // hunks due to lack of contexts, but is way faster than full diff.
             let left_lines = match_lines(&left_content, text_pattern);
@@ -1209,7 +1253,13 @@ fn to_file_content(path: &RepoPath, value: MaterializedTreeValue) -> BackendResu
         }
         MaterializedTreeValue::Symlink { id: _, target } => Ok(target.into_bytes()),
         MaterializedTreeValue::GitSubmodule(_) => Ok(vec![]),
-        MaterializedTreeValue::Conflict { contents, .. } => Ok(contents),
+        MaterializedTreeValue::FileConflict { contents, .. } => {
+            let mut content = vec![];
+            materialize_merge_result(&contents, &mut content)
+                .expect("Failed to materialize conflict to in-memory buffer");
+            Ok(content)
+        }
+        MaterializedTreeValue::OtherConflict { .. } => Ok(vec![]),
         MaterializedTreeValue::Tree(id) => {
             panic!("Unexpected tree with id {id:?} in diff at path {path:?}");
         }

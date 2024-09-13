@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::StreamExt as _;
 use itertools::Itertools;
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::repo::Repo;
-use jj_lib::repo_path::{RepoPath, RepoPathBuf};
-use jj_lib::working_copy::{CheckoutStats, WorkingCopy};
-use testutils::{commit_with_tree, create_tree, TestWorkspace};
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::working_copy::CheckoutStats;
+use jj_lib::working_copy::WorkingCopy;
+use pollster::FutureExt as _;
+use testutils::commit_with_tree;
+use testutils::create_tree;
+use testutils::TestWorkspace;
 
 fn to_owned_path_vec(paths: &[&RepoPath]) -> Vec<RepoPathBuf> {
     paths.iter().map(|&path| path.to_owned()).collect()
@@ -101,7 +107,7 @@ fn test_sparse_checkout() {
     // Reload the state to check that it was persisted
     let wc = LocalWorkingCopy::load(
         repo.store().clone(),
-        wc.path().to_path_buf(),
+        ws.workspace_root().to_path_buf(),
         wc.state_path().to_path_buf(),
     );
     assert_eq!(
@@ -194,9 +200,12 @@ fn test_sparse_commit() {
     // Create a tree from the working copy. Only dir1/file1 should be updated in the
     // tree.
     let modified_tree = test_workspace.snapshot().unwrap();
-    let diff = tree.diff(&modified_tree, &EverythingMatcher).collect_vec();
+    let diff: Vec<_> = tree
+        .diff_stream(&modified_tree, &EverythingMatcher)
+        .collect()
+        .block_on();
     assert_eq!(diff.len(), 1);
-    assert_eq!(diff[0].0.as_ref(), dir1_file1_path);
+    assert_eq!(diff[0].path.as_ref(), dir1_file1_path);
 
     // Set sparse patterns to also include dir2/
     let mut locked_ws = test_workspace
@@ -213,10 +222,13 @@ fn test_sparse_commit() {
     // Create a tree from the working copy. Only dir1/file1 and dir2/file1 should be
     // updated in the tree.
     let modified_tree = test_workspace.snapshot().unwrap();
-    let diff = tree.diff(&modified_tree, &EverythingMatcher).collect_vec();
+    let diff: Vec<_> = tree
+        .diff_stream(&modified_tree, &EverythingMatcher)
+        .collect()
+        .block_on();
     assert_eq!(diff.len(), 2);
-    assert_eq!(diff[0].0.as_ref(), dir1_file1_path);
-    assert_eq!(diff[1].0.as_ref(), dir2_file1_path);
+    assert_eq!(diff[0].path.as_ref(), dir1_file1_path);
+    assert_eq!(diff[1].path.as_ref(), dir2_file1_path);
 }
 
 #[test]

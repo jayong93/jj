@@ -22,14 +22,26 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::backend::{
-    Backend, BackendError, BackendLoadError, BackendResult, ChangeId, Commit, CommitId, Conflict,
-    ConflictId, CopyRecord, FileId, SigningFn, SymlinkId, Tree, TreeId,
-};
+use crate::backend::Backend;
+use crate::backend::BackendError;
+use crate::backend::BackendLoadError;
+use crate::backend::BackendResult;
+use crate::backend::ChangeId;
+use crate::backend::Commit;
+use crate::backend::CommitId;
+use crate::backend::Conflict;
+use crate::backend::ConflictId;
+use crate::backend::CopyRecord;
+use crate::backend::FileId;
+use crate::backend::SigningFn;
+use crate::backend::SymlinkId;
+use crate::backend::Tree;
+use crate::backend::TreeId;
 use crate::git_backend::GitBackend;
 use crate::index::Index;
 use crate::object_id::ObjectId;
-use crate::repo_path::{RepoPath, RepoPathBuf};
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::settings::UserSettings;
 
 const SECRET_CONTENTS_HEX: [&str; 2] = [
@@ -170,11 +182,11 @@ impl Backend for SecretBackend {
 
     fn get_copy_records(
         &self,
-        paths: &[RepoPathBuf],
-        roots: &[CommitId],
-        heads: &[CommitId],
+        paths: Option<&[RepoPathBuf]>,
+        root: &CommitId,
+        head: &CommitId,
     ) -> BackendResult<BoxStream<BackendResult<CopyRecord>>> {
-        self.inner.get_copy_records(paths, roots, heads)
+        self.inner.get_copy_records(paths, root, head)
     }
 
     fn gc(&self, index: &dyn Index, keep_newer: SystemTime) -> BackendResult<()> {

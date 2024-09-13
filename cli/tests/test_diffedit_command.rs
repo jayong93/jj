@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{escaped_fake_diff_editor_path, TestEnvironment};
+use crate::common::escaped_fake_diff_editor_path;
+use crate::common::TestEnvironment;
 
 #[test]
 fn test_diffedit() {
@@ -445,7 +446,7 @@ fn test_diffedit_old_restore_interactive_tests() {
     insta::assert_snapshot!(stdout, @r###"
     D file1
     M file2
-    A file3
+    C {file2 => file3}
     "###);
 
     // Nothing happens if the diff-editor exits with an error
@@ -459,7 +460,7 @@ fn test_diffedit_old_restore_interactive_tests() {
     insta::assert_snapshot!(stdout, @r###"
     D file1
     M file2
-    A file3
+    C {file2 => file3}
     "###);
 
     // Can restore changes to individual files

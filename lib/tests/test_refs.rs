@@ -16,7 +16,8 @@ use jj_lib::merge::Merge;
 use jj_lib::op_store::RefTarget;
 use jj_lib::refs::merge_ref_targets;
 use jj_lib::repo::Repo;
-use testutils::{CommitGraphBuilder, TestWorkspace};
+use testutils::CommitGraphBuilder;
+use testutils::TestWorkspace;
 
 #[test]
 fn test_merge_ref_targets() {
@@ -357,6 +358,36 @@ fn test_merge_ref_targets() {
             &RefTarget::from_legacy_form(
                 [commit2.id().clone()],
                 [commit3.id().clone(), commit4.id().clone()]
+            ),
+        ),
+        target4
+    );
+
+    // Existing conflict on left, right moves one side of conflict to the other
+    // side ("A - B + A" - type conflict)
+    assert_eq!(
+        merge_ref_targets(
+            index,
+            &RefTarget::from_legacy_form(
+                [commit5.id().clone()], // not an ancestor of commit3, 4
+                [commit3.id().clone(), commit4.id().clone()],
+            ),
+            &target4,
+            &target3,
+        ),
+        target3
+    );
+
+    // Existing conflict on right, left moves one side of conflict to the other
+    // side ("A - B + A" - type conflict)
+    assert_eq!(
+        merge_ref_targets(
+            index,
+            &target4,
+            &target3,
+            &RefTarget::from_legacy_form(
+                [commit5.id().clone()], // not an ancestor of commit3, 4
+                [commit3.id().clone(), commit4.id().clone()],
             ),
         ),
         target4

@@ -15,8 +15,10 @@
 use itertools::Itertools;
 
 use super::diff::show_op_diff;
-use crate::cli_util::{CommandHelper, LogContentFormat};
-use crate::command_error::{user_error, CommandError};
+use crate::cli_util::CommandHelper;
+use crate::cli_util::LogContentFormat;
+use crate::command_error::user_error;
+use crate::command_error::CommandError;
 use crate::diff_util::DiffFormatArgs;
 use crate::operation_templater::OperationTemplateLanguage;
 use crate::ui::Ui;
@@ -25,7 +27,7 @@ use crate::ui::Ui;
 #[derive(clap::Args, Clone, Debug)]
 pub struct OperationShowArgs {
     /// Show repository changes in this operation, compared to its parent(s)
-    #[arg(visible_alias = "op", default_value = "@")]
+    #[arg(default_value = "@")]
     operation: String,
     /// Don't show the graph, show a flat list of modified changes
     #[arg(long)]

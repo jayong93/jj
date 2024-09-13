@@ -18,8 +18,10 @@ use itertools::EitherOrBoth;
 
 use crate::backend::CommitId;
 use crate::index::Index;
-use crate::merge::{trivial_merge, Merge};
-use crate::op_store::{RefTarget, RemoteRef};
+use crate::merge::trivial_merge;
+use crate::merge::Merge;
+use crate::op_store::RefTarget;
+use crate::op_store::RemoteRef;
 
 /// Compares `refs1` and `refs2` targets, yields entry if they differ.
 ///
@@ -100,10 +102,16 @@ pub fn merge_ref_targets(
     ])
     .flatten()
     .simplify();
-    if !merge.is_resolved() {
+    // Suppose left = [A - C + B], base = [B], right = [A], the merge result is
+    // [A - C + A], which can now be trivially resolved.
+    if let Some(resolved) = merge.resolve_trivial() {
+        RefTarget::resolved(resolved.clone())
+    } else {
         merge_ref_targets_non_trivial(index, &mut merge);
+        // TODO: Maybe better to try resolve_trivial() again, but the result is
+        // unreliable since merge_ref_targets_non_trivial() is order dependent.
+        RefTarget::from_merge(merge)
     }
-    RefTarget::from_merge(merge)
 }
 
 pub fn merge_remote_refs(

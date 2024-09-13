@@ -16,40 +16,75 @@
 
 use std::any::Any;
 use std::collections::HashSet;
-use std::fmt::{Debug, Error, Formatter};
-use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::fmt::Debug;
+use std::fmt::Error;
+use std::fmt::Formatter;
+use std::fs;
+use std::io;
+use std::io::Cursor;
+use std::io::Read;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::ExitStatus;
+use std::str;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::time::SystemTime;
-use std::{fs, io, str};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use gix::bstr::{BStr, BString};
-use gix::objs::{CommitRef, CommitRefIter, WriteTo};
+use gix::bstr::BString;
+use gix::objs::CommitRef;
+use gix::objs::CommitRefIter;
+use gix::objs::WriteTo;
 use itertools::Itertools;
 use pollster::FutureExt;
 use prost::Message;
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::backend::{
-    make_root_commit, Backend, BackendError, BackendInitError, BackendLoadError, BackendResult,
-    ChangeId, Commit, CommitId, Conflict, ConflictId, ConflictTerm, CopyRecord, CopySource,
-    CopySources, FileId, MergedTreeId, MillisSinceEpoch, SecureSig, Signature, SigningFn,
-    SymlinkId, Timestamp, Tree, TreeId, TreeValue,
-};
-use crate::file_util::{IoResultExt as _, PathError};
+use crate::backend::make_root_commit;
+use crate::backend::Backend;
+use crate::backend::BackendError;
+use crate::backend::BackendInitError;
+use crate::backend::BackendLoadError;
+use crate::backend::BackendResult;
+use crate::backend::ChangeId;
+use crate::backend::Commit;
+use crate::backend::CommitId;
+use crate::backend::Conflict;
+use crate::backend::ConflictId;
+use crate::backend::ConflictTerm;
+use crate::backend::CopyRecord;
+use crate::backend::FileId;
+use crate::backend::MergedTreeId;
+use crate::backend::MillisSinceEpoch;
+use crate::backend::SecureSig;
+use crate::backend::Signature;
+use crate::backend::SigningFn;
+use crate::backend::SymlinkId;
+use crate::backend::Timestamp;
+use crate::backend::Tree;
+use crate::backend::TreeId;
+use crate::backend::TreeValue;
+use crate::file_util::IoResultExt as _;
+use crate::file_util::PathError;
 use crate::index::Index;
 use crate::lock::FileLock;
-use crate::merge::{Merge, MergeBuilder};
+use crate::merge::Merge;
+use crate::merge::MergeBuilder;
 use crate::object_id::ObjectId;
-use crate::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
+use crate::repo_path::RepoPathComponentBuf;
 use crate::settings::UserSettings;
-use crate::stacked_table::{
-    MutableTable, ReadonlyTable, TableSegment, TableStore, TableStoreError,
-};
+use crate::stacked_table::MutableTable;
+use crate::stacked_table::ReadonlyTable;
+use crate::stacked_table::TableSegment;
+use crate::stacked_table::TableStore;
+use crate::stacked_table::TableStoreError;
 
 const HASH_LENGTH: usize = 20;
 const CHANGE_ID_LENGTH: usize = 16;
@@ -124,8 +159,6 @@ pub struct GitBackend {
     empty_tree_id: TreeId,
     extra_metadata_store: TableStore,
     cached_extra_metadata: Mutex<Option<Arc<ReadonlyTable>>>,
-    /// Whether tree of imported commit should be promoted to non-legacy format.
-    imported_commit_uses_tree_conflict_format: bool,
 }
 
 impl GitBackend {
@@ -133,11 +166,7 @@ impl GitBackend {
         "git"
     }
 
-    fn new(
-        base_repo: gix::ThreadSafeRepository,
-        extra_metadata_store: TableStore,
-        imported_commit_uses_tree_conflict_format: bool,
-    ) -> Self {
+    fn new(base_repo: gix::ThreadSafeRepository, extra_metadata_store: TableStore) -> Self {
         let repo = Mutex::new(base_repo.to_thread_local());
         let root_commit_id = CommitId::from_bytes(&[0; HASH_LENGTH]);
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
@@ -150,7 +179,6 @@ impl GitBackend {
             empty_tree_id,
             extra_metadata_store,
             cached_extra_metadata: Mutex::new(None),
-            imported_commit_uses_tree_conflict_format,
         }
     }
 
@@ -166,7 +194,7 @@ impl GitBackend {
             gix_open_opts_from_settings(settings),
         )
         .map_err(GitBackendInitError::InitRepository)?;
-        Self::init_with_repo(settings, store_path, git_repo_path, git_repo)
+        Self::init_with_repo(store_path, git_repo_path, git_repo)
     }
 
     /// Initializes backend by creating a new Git repo at the specified
@@ -190,7 +218,7 @@ impl GitBackend {
         )
         .map_err(GitBackendInitError::InitRepository)?;
         let git_repo_path = workspace_root.join(".git");
-        Self::init_with_repo(settings, store_path, &git_repo_path, git_repo)
+        Self::init_with_repo(store_path, &git_repo_path, git_repo)
     }
 
     /// Initializes backend with an existing Git repo at the specified path.
@@ -210,11 +238,10 @@ impl GitBackend {
             gix_open_opts_from_settings(settings),
         )
         .map_err(GitBackendInitError::OpenRepository)?;
-        Self::init_with_repo(settings, store_path, git_repo_path, git_repo)
+        Self::init_with_repo(store_path, git_repo_path, git_repo)
     }
 
     fn init_with_repo(
-        settings: &UserSettings,
         store_path: &Path,
         git_repo_path: &Path,
         git_repo: gix::ThreadSafeRepository,
@@ -244,11 +271,7 @@ impl GitBackend {
                 .map_err(GitBackendInitError::Path)?;
         };
         let extra_metadata_store = TableStore::init(extra_path, HASH_LENGTH);
-        Ok(GitBackend::new(
-            git_repo,
-            extra_metadata_store,
-            settings.use_tree_conflict_format(),
-        ))
+        Ok(GitBackend::new(git_repo, extra_metadata_store))
     }
 
     pub fn load(
@@ -271,11 +294,7 @@ impl GitBackend {
         )
         .map_err(GitBackendLoadError::OpenRepository)?;
         let extra_metadata_store = TableStore::load(store_path.join("extra"), HASH_LENGTH);
-        Ok(GitBackend::new(
-            repo,
-            extra_metadata_store,
-            settings.use_tree_conflict_format(),
-        ))
+        Ok(GitBackend::new(repo, extra_metadata_store))
     }
 
     fn lock_git_repo(&self) -> MutexGuard<'_, gix::Repository> {
@@ -349,6 +368,14 @@ impl GitBackend {
         &self,
         head_ids: impl IntoIterator<Item = &'a CommitId>,
     ) -> BackendResult<()> {
+        self.import_head_commits_with_tree_conflicts(head_ids, true)
+    }
+
+    fn import_head_commits_with_tree_conflicts<'a>(
+        &self,
+        head_ids: impl IntoIterator<Item = &'a CommitId>,
+        uses_tree_conflict_format: bool,
+    ) -> BackendResult<()> {
         let head_ids: HashSet<&CommitId> = head_ids
             .into_iter()
             .filter(|&id| *id != self.root_commit_id)
@@ -377,7 +404,7 @@ impl GitBackend {
             &mut mut_table,
             &table_lock,
             &head_ids,
-            self.imported_commit_uses_tree_conflict_format,
+            uses_tree_conflict_format,
         )?;
         self.save_extra_metadata_table(mut_table, &table_lock)
     }
@@ -669,7 +696,7 @@ fn deserialize_extras(commit: &mut Commit, bytes: &[u8]) {
 /// Used for preventing GC of commits we create.
 fn to_no_gc_ref_update(id: &CommitId) -> gix::refs::transaction::RefEdit {
     let name = format!("{NO_GC_REF_NAMESPACE}{}", id.hex());
-    let new = gix::refs::Target::Peeled(validate_git_object_id(id).unwrap());
+    let new = gix::refs::Target::Object(validate_git_object_id(id).unwrap());
     let expected = gix::refs::transaction::PreviousValue::ExistingMustMatch(new.clone());
     gix::refs::transaction::RefEdit {
         change: gix::refs::transaction::Change::Update {
@@ -1255,29 +1282,14 @@ impl Backend for GitBackend {
 
     fn get_copy_records(
         &self,
-        paths: &[RepoPathBuf],
-        roots: &[CommitId],
-        heads: &[CommitId],
+        paths: Option<&[RepoPathBuf]>,
+        root_id: &CommitId,
+        head_id: &CommitId,
     ) -> BackendResult<BoxStream<BackendResult<CopyRecord>>> {
-        if paths.is_empty() || roots.is_empty() || heads.is_empty() {
-            return Ok(Box::pin(futures::stream::empty()));
-        }
-        if roots.len() != 1 || heads.len() != 1 {
-            return Err(BackendError::Unsupported(
-                "GitBackend does not support getting copy records for multiple commits".into(),
-            ));
-        }
-        let root_id = &roots[0];
-        let head_id = &heads[0];
-
         let repo = self.git_repo();
         let root_tree = self.read_tree_for_commit(&repo, root_id)?;
         let head_tree = self.read_tree_for_commit(&repo, head_id)?;
 
-        let paths: HashSet<&BStr> = paths
-            .iter()
-            .map(|p| BStr::new(p.as_internal_file_string()))
-            .collect();
         let change_to_copy_record =
             |change: gix::object::tree::diff::Change| -> BackendResult<Option<CopyRecord>> {
                 let gix::object::tree::diff::Change {
@@ -1293,22 +1305,23 @@ impl Backend for GitBackend {
                 else {
                     return Ok(None);
                 };
-                if !paths.contains(dest_location) {
-                    return Ok(None);
-                }
 
                 let source = str::from_utf8(source_location)
                     .map_err(|err| to_invalid_utf8_err(err, root_id))?;
                 let dest = str::from_utf8(dest_location)
                     .map_err(|err| to_invalid_utf8_err(err, head_id))?;
+
+                let target = RepoPathBuf::from_internal_string(dest);
+                if !paths.map_or(true, |paths| paths.contains(&target)) {
+                    return Ok(None);
+                }
+
                 Ok(Some(CopyRecord {
-                    target: RepoPathBuf::from_internal_string(dest),
-                    id: head_id.clone(),
-                    sources: CopySources::Resolved(CopySource {
-                        path: RepoPathBuf::from_internal_string(source),
-                        file: FileId::from_bytes(source_id.as_bytes()),
-                        commit: Some(root_id.clone()),
-                    }),
+                    target,
+                    target_commit: head_id.clone(),
+                    source: RepoPathBuf::from_internal_string(source),
+                    source_file: FileId::from_bytes(source_id.as_bytes()),
+                    source_commit: root_id.clone(),
                 }))
             };
 
@@ -1317,6 +1330,14 @@ impl Backend for GitBackend {
             .changes()
             .map_err(|err| BackendError::Other(err.into()))?;
         change_platform.track_path();
+        change_platform.track_rewrites(Some(gix::diff::Rewrites {
+            copies: Some(gix::diff::rewrites::Copies {
+                source: gix::diff::rewrites::CopySource::FromSetOfModifiedFiles,
+                percentage: Some(0.5),
+            }),
+            percentage: Some(0.5),
+            limit: 1000,
+        }));
         change_platform
             .for_each_to_obtain_tree_with_cache(
                 &head_tree,
@@ -1497,14 +1518,7 @@ mod tests {
     #[test_case(false; "legacy tree format")]
     #[test_case(true; "tree-level conflict format")]
     fn read_plain_git_commit(uses_tree_conflict_format: bool) {
-        let settings = {
-            let config = config::Config::builder()
-                .set_override("format.tree-level-conflicts", uses_tree_conflict_format)
-                .unwrap()
-                .build()
-                .unwrap();
-            UserSettings::from_config(config)
-        };
+        let settings = user_settings();
         let temp_dir = testutils::new_temp_dir();
         let store_path = temp_dir.path();
         let git_repo_path = temp_dir.path().join("git");
@@ -1567,7 +1581,9 @@ mod tests {
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path()).unwrap();
 
         // Import the head commit and its ancestors
-        backend.import_head_commits([&commit_id2]).unwrap();
+        backend
+            .import_head_commits_with_tree_conflicts([&commit_id2], uses_tree_conflict_format)
+            .unwrap();
         // Ref should be created only for the head commit
         let git_refs = backend
             .open_git_repo()

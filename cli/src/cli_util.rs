@@ -12,96 +12,161 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::fmt;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
-use std::env::{self, ArgsOs, VarError};
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::env;
+use std::env::ArgsOs;
+use std::env::VarError;
 use std::ffi::OsString;
+use std::fmt;
 use std::fmt::Debug;
-use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io;
+use std::io::Write as _;
+use std::mem;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::str;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::{fs, mem, str};
 
 use bstr::ByteVec as _;
 use chrono::TimeZone;
-use clap::builder::{
-    MapValueParser, NonEmptyStringValueParser, TypedValueParser, ValueParserFactory,
-};
-use clap::error::{ContextKind, ContextValue};
-use clap::{ArgAction, ArgMatches, Command, FromArgMatches};
-use indexmap::{IndexMap, IndexSet};
+use clap::builder::MapValueParser;
+use clap::builder::NonEmptyStringValueParser;
+use clap::builder::TypedValueParser;
+use clap::builder::ValueParserFactory;
+use clap::error::ContextKind;
+use clap::error::ContextValue;
+use clap::ArgAction;
+use clap::ArgMatches;
+use clap::Command;
+use clap::FromArgMatches;
+use indexmap::IndexMap;
+use indexmap::IndexSet;
 use itertools::Itertools;
-use jj_lib::backend::{ChangeId, CommitId, MergedTreeId, TreeValue};
+use jj_lib::backend::ChangeId;
+use jj_lib::backend::CommitId;
+use jj_lib::backend::MergedTreeId;
+use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
+use jj_lib::dag_walk;
+use jj_lib::file_util;
+use jj_lib::fileset;
 use jj_lib::fileset::FilesetExpression;
+use jj_lib::git;
 use jj_lib::git_backend::GitBackend;
-use jj_lib::gitignore::{GitIgnoreError, GitIgnoreFile};
+use jj_lib::gitignore::GitIgnoreError;
+use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::hex_util::to_reverse_hex;
 use jj_lib::id_prefix::IdPrefixContext;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::MergedTreeValue;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
-use jj_lib::op_store::{OpStoreError, OperationId, RefTarget, WorkspaceId};
+use jj_lib::op_heads_store;
+use jj_lib::op_store::OpStoreError;
+use jj_lib::op_store::OperationId;
+use jj_lib::op_store::RefTarget;
+use jj_lib::op_store::WorkspaceId;
+use jj_lib::op_walk;
 use jj_lib::op_walk::OpsetEvaluationError;
 use jj_lib::operation::Operation;
-use jj_lib::repo::{
-    merge_factories_map, CheckOutCommitError, EditCommitError, MutableRepo, ReadonlyRepo, Repo,
-    RepoLoader, StoreFactories, StoreLoadError,
-};
-use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter, UiPathParseError};
-use jj_lib::revset::{
-    RevsetAliasesMap, RevsetExpression, RevsetExtensions, RevsetFilterPredicate, RevsetFunction,
-    RevsetIteratorExt, RevsetModifier, RevsetParseContext, RevsetWorkspaceContext,
-    SymbolResolverExtension,
-};
+use jj_lib::repo::merge_factories_map;
+use jj_lib::repo::CheckOutCommitError;
+use jj_lib::repo::EditCommitError;
+use jj_lib::repo::MutableRepo;
+use jj_lib::repo::ReadonlyRepo;
+use jj_lib::repo::Repo;
+use jj_lib::repo::RepoLoader;
+use jj_lib::repo::StoreFactories;
+use jj_lib::repo::StoreLoadError;
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::repo_path::RepoPathUiConverter;
+use jj_lib::repo_path::UiPathParseError;
+use jj_lib::revset;
+use jj_lib::revset::RevsetAliasesMap;
+use jj_lib::revset::RevsetExpression;
+use jj_lib::revset::RevsetExtensions;
+use jj_lib::revset::RevsetFilterPredicate;
+use jj_lib::revset::RevsetFunction;
+use jj_lib::revset::RevsetIteratorExt;
+use jj_lib::revset::RevsetModifier;
+use jj_lib::revset::RevsetParseContext;
+use jj_lib::revset::RevsetWorkspaceContext;
+use jj_lib::revset::SymbolResolverExtension;
 use jj_lib::rewrite::restore_tree;
-use jj_lib::settings::{ConfigResultExt as _, UserSettings};
+use jj_lib::settings::ConfigResultExt as _;
+use jj_lib::settings::UserSettings;
 use jj_lib::signing::SignInitError;
 use jj_lib::str_util::StringPattern;
 use jj_lib::transaction::Transaction;
 use jj_lib::view::View;
-use jj_lib::working_copy::{
-    CheckoutStats, LockedWorkingCopy, SnapshotOptions, WorkingCopy, WorkingCopyFactory,
-};
-use jj_lib::workspace::{
-    default_working_copy_factories, LockedWorkspace, WorkingCopyFactories, Workspace,
-    WorkspaceLoadError, WorkspaceLoader,
-};
-use jj_lib::{dag_walk, fileset, git, op_heads_store, op_walk, revset};
+use jj_lib::working_copy::CheckoutStats;
+use jj_lib::working_copy::LockedWorkingCopy;
+use jj_lib::working_copy::SnapshotOptions;
+use jj_lib::working_copy::WorkingCopy;
+use jj_lib::working_copy::WorkingCopyFactory;
+use jj_lib::workspace::default_working_copy_factories;
+use jj_lib::workspace::get_working_copy_factory;
+use jj_lib::workspace::DefaultWorkspaceLoaderFactory;
+use jj_lib::workspace::LockedWorkspace;
+use jj_lib::workspace::WorkingCopyFactories;
+use jj_lib::workspace::Workspace;
+use jj_lib::workspace::WorkspaceLoadError;
+use jj_lib::workspace::WorkspaceLoader;
+use jj_lib::workspace::WorkspaceLoaderFactory;
 use once_cell::unsync::OnceCell;
 use tracing::instrument;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
 
-use crate::command_error::{
-    cli_error, config_error_with_message, handle_command_result, internal_error,
-    internal_error_with_message, user_error, user_error_with_hint, user_error_with_message,
-    CommandError,
-};
-use crate::commit_templater::{CommitTemplateLanguage, CommitTemplateLanguageExtension};
-use crate::config::{
-    new_config_path, AnnotatedValue, CommandNameAndArgs, ConfigNamePathBuf, ConfigSource,
-    LayeredConfigs,
-};
-use crate::diff_util::{self, DiffFormat, DiffFormatArgs, DiffRenderer};
-use crate::formatter::{FormatRecorder, Formatter, PlainTextFormatter};
-use crate::git_util::{
-    is_colocated_git_workspace, print_failed_git_export, print_git_import_stats,
-};
-use crate::merge_tools::{DiffEditor, MergeEditor, MergeToolConfigError};
+use crate::command_error::cli_error;
+use crate::command_error::config_error_with_message;
+use crate::command_error::handle_command_result;
+use crate::command_error::internal_error;
+use crate::command_error::internal_error_with_message;
+use crate::command_error::user_error;
+use crate::command_error::user_error_with_hint;
+use crate::command_error::user_error_with_message;
+use crate::command_error::CommandError;
+use crate::commit_templater::CommitTemplateLanguage;
+use crate::commit_templater::CommitTemplateLanguageExtension;
+use crate::config::new_config_path;
+use crate::config::AnnotatedValue;
+use crate::config::CommandNameAndArgs;
+use crate::config::ConfigNamePathBuf;
+use crate::config::ConfigSource;
+use crate::config::LayeredConfigs;
+use crate::diff_util;
+use crate::diff_util::DiffFormat;
+use crate::diff_util::DiffFormatArgs;
+use crate::diff_util::DiffRenderer;
+use crate::formatter::FormatRecorder;
+use crate::formatter::Formatter;
+use crate::formatter::PlainTextFormatter;
+use crate::git_util::is_colocated_git_workspace;
+use crate::git_util::print_failed_git_export;
+use crate::git_util::print_git_import_stats;
+use crate::merge_tools::DiffEditor;
+use crate::merge_tools::MergeEditor;
+use crate::merge_tools::MergeToolConfigError;
 use crate::operation_templater::OperationTemplateLanguageExtension;
+use crate::revset_util;
 use crate::revset_util::RevsetExpressionEvaluator;
+use crate::template_builder;
 use crate::template_builder::TemplateLanguage;
 use crate::template_parser::TemplateAliasesMap;
-use crate::templater::{PropertyPlaceholder, TemplateRenderer};
-use crate::ui::{ColorChoice, Ui};
-use crate::{revset_util, template_builder, text_util};
+use crate::templater::PropertyPlaceholder;
+use crate::templater::TemplateRenderer;
+use crate::text_util;
+use crate::ui::ColorChoice;
+use crate::ui::Ui;
 
 #[derive(Clone)]
 struct ChromeTracingFlushGuard {
@@ -190,7 +255,12 @@ impl TracingSubscription {
     }
 }
 
+#[derive(Clone)]
 pub struct CommandHelper {
+    data: Rc<CommandHelperData>,
+}
+
+struct CommandHelperData {
     app: Command,
     cwd: PathBuf,
     string_args: Vec<String>,
@@ -201,14 +271,14 @@ pub struct CommandHelper {
     revset_extensions: Arc<RevsetExtensions>,
     commit_template_extensions: Vec<Arc<dyn CommitTemplateLanguageExtension>>,
     operation_template_extensions: Vec<Arc<dyn OperationTemplateLanguageExtension>>,
-    maybe_workspace_loader: Result<WorkspaceLoader, CommandError>,
+    maybe_workspace_loader: Result<Box<dyn WorkspaceLoader>, CommandError>,
     store_factories: StoreFactories,
     working_copy_factories: WorkingCopyFactories,
 }
 
 impl CommandHelper {
     pub fn app(&self) -> &Command {
-        &self.app
+        &self.data.app
     }
 
     /// Canonical form of the current working directory path.
@@ -216,34 +286,34 @@ impl CommandHelper {
     /// A loaded `Workspace::workspace_root()` also returns a canonical path, so
     /// relative paths can be easily computed from these paths.
     pub fn cwd(&self) -> &Path {
-        &self.cwd
+        &self.data.cwd
     }
 
     pub fn string_args(&self) -> &Vec<String> {
-        &self.string_args
+        &self.data.string_args
     }
 
     pub fn matches(&self) -> &ArgMatches {
-        &self.matches
+        &self.data.matches
     }
 
     pub fn global_args(&self) -> &GlobalArgs {
-        &self.global_args
+        &self.data.global_args
     }
 
     pub fn settings(&self) -> &UserSettings {
-        &self.settings
+        &self.data.settings
     }
 
     pub fn resolved_config_values(
         &self,
         prefix: &ConfigNamePathBuf,
     ) -> Result<Vec<AnnotatedValue>, crate::config::ConfigError> {
-        self.layered_configs.resolved_config_values(prefix)
+        self.data.layered_configs.resolved_config_values(prefix)
     }
 
     pub fn revset_extensions(&self) -> &Arc<RevsetExtensions> {
-        &self.revset_extensions
+        &self.data.revset_extensions
     }
 
     /// Loads template aliases from the configs.
@@ -251,7 +321,7 @@ impl CommandHelper {
     /// For most commands that depend on a loaded repo, you should use
     /// `WorkspaceCommandHelper::template_aliases_map()` instead.
     fn load_template_aliases(&self, ui: &Ui) -> Result<TemplateAliasesMap, CommandError> {
-        load_template_aliases(ui, &self.layered_configs)
+        load_template_aliases(ui, &self.data.layered_configs)
     }
 
     /// Parses template of the given language into evaluation tree.
@@ -276,11 +346,14 @@ impl CommandHelper {
     }
 
     pub fn operation_template_extensions(&self) -> &[Arc<dyn OperationTemplateLanguageExtension>] {
-        &self.operation_template_extensions
+        &self.data.operation_template_extensions
     }
 
-    pub fn workspace_loader(&self) -> Result<&WorkspaceLoader, CommandError> {
-        self.maybe_workspace_loader.as_ref().map_err(Clone::clone)
+    pub fn workspace_loader(&self) -> Result<&dyn WorkspaceLoader, CommandError> {
+        self.data
+            .maybe_workspace_loader
+            .as_deref()
+            .map_err(Clone::clone)
     }
 
     /// Loads workspace and repo, then snapshots the working copy if allowed.
@@ -308,11 +381,12 @@ impl CommandHelper {
         let loader = self.workspace_loader()?;
 
         // We convert StoreLoadError -> WorkspaceLoadError -> CommandError
-        let factory: Result<_, WorkspaceLoadError> = loader
-            .get_working_copy_factory(&self.working_copy_factories)
-            .map_err(|e| e.into());
-        let factory = factory
-            .map_err(|err| map_workspace_load_error(err, self.global_args.repository.as_deref()))?;
+        let factory: Result<_, WorkspaceLoadError> =
+            get_working_copy_factory(loader, &self.data.working_copy_factories)
+                .map_err(|e| e.into());
+        let factory = factory.map_err(|err| {
+            map_workspace_load_error(err, self.data.global_args.repository.as_deref())
+        })?;
         Ok(factory)
     }
 
@@ -321,24 +395,29 @@ impl CommandHelper {
         let loader = self.workspace_loader()?;
         loader
             .load(
-                &self.settings,
-                &self.store_factories,
-                &self.working_copy_factories,
+                &self.data.settings,
+                &self.data.store_factories,
+                &self.data.working_copy_factories,
             )
-            .map_err(|err| map_workspace_load_error(err, self.global_args.repository.as_deref()))
+            .map_err(|err| {
+                map_workspace_load_error(err, self.data.global_args.repository.as_deref())
+            })
     }
 
     /// Returns true if the working copy to be loaded is writable, and therefore
     /// should usually be snapshotted.
     pub fn is_working_copy_writable(&self) -> bool {
-        self.is_at_head_operation() && !self.global_args.ignore_working_copy
+        self.is_at_head_operation() && !self.data.global_args.ignore_working_copy
     }
 
     /// Returns true if the current operation is considered to be the head.
     pub fn is_at_head_operation(&self) -> bool {
         // TODO: should we accept --at-op=<head_id> as the head op? or should we
         // make --at-op=@ imply --ignore-workign-copy (i.e. not at the head.)
-        matches!(self.global_args.at_operation.as_deref(), None | Some("@"))
+        matches!(
+            self.data.global_args.at_operation.as_deref(),
+            None | Some("@")
+        )
     }
 
     /// Resolves the current operation from the command-line argument.
@@ -351,7 +430,7 @@ impl CommandHelper {
         ui: &mut Ui,
         repo_loader: &RepoLoader,
     ) -> Result<Operation, CommandError> {
-        if let Some(op_str) = &self.global_args.at_operation {
+        if let Some(op_str) = &self.data.global_args.at_operation {
             Ok(op_walk::resolve_op_for_load(repo_loader, op_str)?)
         } else {
             op_heads_store::resolve_op_heads(
@@ -364,11 +443,14 @@ impl CommandHelper {
                     )?;
                     let base_repo = repo_loader.load_at(&op_heads[0])?;
                     // TODO: It may be helpful to print each operation we're merging here
-                    let mut tx =
-                        start_repo_transaction(&base_repo, &self.settings, &self.string_args);
+                    let mut tx = start_repo_transaction(
+                        &base_repo,
+                        &self.data.settings,
+                        &self.data.string_args,
+                    );
                     for other_op_head in op_heads.into_iter().skip(1) {
                         tx.merge_operation(other_op_head)?;
-                        let num_rebased = tx.mut_repo().rebase_descendants(&self.settings)?;
+                        let num_rebased = tx.mut_repo().rebase_descendants(&self.data.settings)?;
                         if num_rebased > 0 {
                             writeln!(
                                 ui.status(),
@@ -378,7 +460,7 @@ impl CommandHelper {
                         }
                     }
                     Ok(tx
-                        .write("resolve concurrent operations")
+                        .write("reconcile divergent operations")
                         .leave_unpublished()
                         .operation()
                         .clone())
@@ -509,15 +591,11 @@ impl AdvanceBranchesSettings {
 /// Provides utilities for writing a command that works on a [`Workspace`]
 /// (which most commands do).
 pub struct WorkspaceCommandHelper {
-    string_args: Vec<String>,
-    global_args: GlobalArgs,
-    settings: UserSettings,
+    command: CommandHelper,
     workspace: Workspace,
     user_repo: ReadonlyUserRepo,
-    revset_extensions: Arc<RevsetExtensions>,
     // TODO: Parsed template can be cached if it doesn't capture 'repo lifetime
     commit_summary_template_text: String,
-    commit_template_extensions: Vec<Arc<dyn CommitTemplateLanguageExtension>>,
     revset_aliases_map: RevsetAliasesMap,
     template_aliases_map: TemplateAliasesMap,
     may_update_working_copy: bool,
@@ -534,26 +612,23 @@ impl WorkspaceCommandHelper {
         repo: Arc<ReadonlyRepo>,
         loaded_at_head: bool,
     ) -> Result<Self, CommandError> {
-        let settings = command.settings.clone();
+        let settings = command.settings();
         let commit_summary_template_text =
             settings.config().get_string("templates.commit_summary")?;
-        let revset_aliases_map = revset_util::load_revset_aliases(ui, &command.layered_configs)?;
+        let revset_aliases_map =
+            revset_util::load_revset_aliases(ui, &command.data.layered_configs)?;
         let template_aliases_map = command.load_template_aliases(ui)?;
-        let may_update_working_copy = loaded_at_head && !command.global_args.ignore_working_copy;
+        let may_update_working_copy = loaded_at_head && !command.global_args().ignore_working_copy;
         let working_copy_shared_with_git = is_colocated_git_workspace(&workspace, &repo);
         let path_converter = RepoPathUiConverter::Fs {
-            cwd: command.cwd.clone(),
+            cwd: command.cwd().to_owned(),
             base: workspace.workspace_root().clone(),
         };
         let helper = Self {
-            string_args: command.string_args.clone(),
-            global_args: command.global_args.clone(),
-            settings,
+            command: command.clone(),
             workspace,
             user_repo: ReadonlyUserRepo::new(repo),
-            revset_extensions: command.revset_extensions.clone(),
             commit_summary_template_text,
-            commit_template_extensions: command.commit_template_extensions.clone(),
             revset_aliases_map,
             template_aliases_map,
             may_update_working_copy,
@@ -566,6 +641,10 @@ impl WorkspaceCommandHelper {
         Ok(helper)
     }
 
+    pub fn settings(&self) -> &UserSettings {
+        self.command.settings()
+    }
+
     pub fn git_backend(&self) -> Option<&GitBackend> {
         self.user_repo.git_backend()
     }
@@ -574,7 +653,7 @@ impl WorkspaceCommandHelper {
         if self.may_update_working_copy {
             Ok(())
         } else {
-            let hint = if self.global_args.ignore_working_copy {
+            let hint = if self.command.global_args().ignore_working_copy {
                 "Don't use --ignore-working-copy."
             } else {
                 "Don't use --at-op."
@@ -616,6 +695,7 @@ impl WorkspaceCommandHelper {
     #[instrument(skip_all)]
     fn import_git_head(&mut self, ui: &mut Ui) -> Result<(), CommandError> {
         assert!(self.may_update_working_copy);
+        let command = self.command.clone();
         let mut tx = self.start_transaction();
         git::import_head(tx.mut_repo())?;
         if !tx.mut_repo().has_changes() {
@@ -639,13 +719,13 @@ impl WorkspaceCommandHelper {
             let workspace_id = self.workspace_id().to_owned();
             let new_git_head_commit = tx.mut_repo().store().get_commit(new_git_head_id)?;
             tx.mut_repo()
-                .check_out(workspace_id, &self.settings, &new_git_head_commit)?;
+                .check_out(workspace_id, command.settings(), &new_git_head_commit)?;
             let mut locked_ws = self.workspace.start_working_copy_mutation()?;
             // The working copy was presumably updated by the git command that updated
             // HEAD, so we just need to reset our working copy
             // state to it without updating working copy files.
             locked_ws.locked_wc().reset(&new_git_head_commit)?;
-            tx.mut_repo().rebase_descendants(&self.settings)?;
+            tx.mut_repo().rebase_descendants(command.settings())?;
             self.user_repo = ReadonlyUserRepo::new(tx.commit("import git head"));
             locked_ws.finish(self.user_repo.repo.op_id().clone())?;
             if old_git_head.is_present() {
@@ -673,7 +753,7 @@ impl WorkspaceCommandHelper {
     /// the working copy parent if the repository is colocated.
     #[instrument(skip_all)]
     fn import_git_refs(&mut self, ui: &mut Ui) -> Result<(), CommandError> {
-        let git_settings = self.settings.git_settings();
+        let git_settings = self.settings().git_settings();
         let mut tx = self.start_transaction();
         // Automated import shouldn't fail because of reserved remote name.
         let stats = git::import_some_refs(tx.mut_repo(), &git_settings, |ref_name| {
@@ -686,7 +766,7 @@ impl WorkspaceCommandHelper {
         print_git_import_stats(ui, tx.repo(), &stats, false)?;
         let mut tx = tx.into_inner();
         // Rebase here to show slightly different status message.
-        let num_rebased = tx.mut_repo().rebase_descendants(&self.settings)?;
+        let num_rebased = tx.mut_repo().rebase_descendants(self.settings())?;
         if num_rebased > 0 {
             writeln!(
                 ui.status(),
@@ -770,7 +850,7 @@ impl WorkspaceCommandHelper {
         // empty arguments.
         if values.is_empty() {
             Ok(FilesetExpression::all())
-        } else if self.settings.config().get_bool("ui.allow-filesets")? {
+        } else if self.settings().config().get_bool("ui.allow-filesets")? {
             self.parse_union_filesets(values)
         } else {
             let expressions = values
@@ -800,17 +880,20 @@ impl WorkspaceCommandHelper {
 
     #[instrument(skip_all)]
     pub fn base_ignores(&self) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
-        fn get_excludes_file_path(config: &gix::config::File) -> Option<PathBuf> {
+        let get_excludes_file_path = |config: &gix::config::File| -> Option<PathBuf> {
             // TODO: maybe use path() and interpolate(), which can process non-utf-8
             // path on Unix.
             if let Some(value) = config.string("core.excludesFile") {
-                str::from_utf8(&value)
+                let path = str::from_utf8(&value)
                     .ok()
-                    .map(crate::git_util::expand_git_path)
+                    .map(file_util::expand_home_path)?;
+                // The configured path is usually absolute, but if it's relative,
+                // the "git" command would read the file at the work-tree directory.
+                Some(self.workspace_root().join(path))
             } else {
                 xdg_config_home().ok().map(|x| x.join("git").join("ignore"))
             }
-        }
+        };
 
         fn xdg_config_home() -> Result<PathBuf, VarError> {
             if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
@@ -847,7 +930,7 @@ impl WorkspaceCommandHelper {
         &self,
         args: &DiffFormatArgs,
     ) -> Result<DiffRenderer<'_>, CommandError> {
-        let formats = diff_util::diff_formats_for(&self.settings, args)?;
+        let formats = diff_util::diff_formats_for(self.settings(), args)?;
         Ok(self.diff_renderer(formats))
     }
 
@@ -859,7 +942,7 @@ impl WorkspaceCommandHelper {
         args: &DiffFormatArgs,
         patch: bool,
     ) -> Result<Option<DiffRenderer<'_>>, CommandError> {
-        let formats = diff_util::diff_formats_for_log(&self.settings, args, patch)?;
+        let formats = diff_util::diff_formats_for_log(self.settings(), args, patch)?;
         Ok((!formats.is_empty()).then(|| self.diff_renderer(formats)))
     }
 
@@ -873,9 +956,13 @@ impl WorkspaceCommandHelper {
     ) -> Result<DiffEditor, CommandError> {
         let base_ignores = self.base_ignores()?;
         if let Some(name) = tool_name {
-            Ok(DiffEditor::with_name(name, &self.settings, base_ignores)?)
+            Ok(DiffEditor::with_name(name, self.settings(), base_ignores)?)
         } else {
-            Ok(DiffEditor::from_settings(ui, &self.settings, base_ignores)?)
+            Ok(DiffEditor::from_settings(
+                ui,
+                self.settings(),
+                base_ignores,
+            )?)
         }
     }
 
@@ -904,9 +991,9 @@ impl WorkspaceCommandHelper {
         tool_name: Option<&str>,
     ) -> Result<MergeEditor, MergeToolConfigError> {
         if let Some(name) = tool_name {
-            MergeEditor::with_name(name, &self.settings)
+            MergeEditor::with_name(name, self.settings())
         } else {
-            MergeEditor::from_settings(ui, &self.settings)
+            MergeEditor::from_settings(ui, self.settings())
         }
     }
 
@@ -942,7 +1029,7 @@ impl WorkspaceCommandHelper {
             let all = match modifier {
                 Some(RevsetModifier::All) => true,
                 None => self
-                    .settings
+                    .settings()
                     .config()
                     .get_bool("ui.always-allow-large-revsets")?,
             };
@@ -1014,7 +1101,7 @@ impl WorkspaceCommandHelper {
     ) -> Result<RevsetExpressionEvaluator<'_>, CommandError> {
         Ok(RevsetExpressionEvaluator::new(
             self.repo().as_ref(),
-            self.revset_extensions.clone(),
+            self.command.revset_extensions().clone(),
             self.id_prefix_context()?,
             expression,
         ))
@@ -1025,7 +1112,7 @@ impl WorkspaceCommandHelper {
             path_converter: &self.path_converter,
             workspace_id: self.workspace_id(),
         };
-        let now = if let Some(timestamp) = self.settings.commit_timestamp() {
+        let now = if let Some(timestamp) = self.settings().commit_timestamp() {
             chrono::Local
                 .timestamp_millis_opt(timestamp.timestamp.0)
                 .unwrap()
@@ -1034,20 +1121,21 @@ impl WorkspaceCommandHelper {
         };
         RevsetParseContext::new(
             &self.revset_aliases_map,
-            self.settings.user_email(),
+            self.settings().user_email(),
             now.into(),
-            &self.revset_extensions,
+            self.command.revset_extensions(),
             Some(workspace_context),
         )
     }
 
     fn new_id_prefix_context(&self) -> Result<IdPrefixContext, CommandError> {
-        let mut context: IdPrefixContext = IdPrefixContext::new(self.revset_extensions.clone());
+        let mut context: IdPrefixContext =
+            IdPrefixContext::new(self.command.revset_extensions().clone());
         let revset_string: String = self
-            .settings
+            .settings()
             .config()
             .get_string("revsets.short-prefixes")
-            .unwrap_or_else(|_| self.settings.default_revset());
+            .unwrap_or_else(|_| self.settings().default_revset());
         if !revset_string.is_empty() {
             let (expression, modifier) =
                 revset::parse_with_modifier(&revset_string, &self.revset_parse_context()).map_err(
@@ -1109,7 +1197,7 @@ impl WorkspaceCommandHelper {
             self.workspace_id(),
             self.revset_parse_context(),
             self.id_prefix_context()?,
-            &self.commit_template_extensions,
+            &self.command.data.commit_template_extensions,
         ))
     }
 
@@ -1148,7 +1236,7 @@ impl WorkspaceCommandHelper {
         repo: &dyn Repo,
         commits: impl IntoIterator<Item = &'a CommitId>,
     ) -> Result<(), CommandError> {
-        if self.global_args.ignore_immutable {
+        if self.command.global_args().ignore_immutable {
             let root_id = self.repo().store().root_commit_id();
             return if commits.into_iter().contains(root_id) {
                 Err(user_error(format!(
@@ -1163,7 +1251,7 @@ impl WorkspaceCommandHelper {
         // Not using self.id_prefix_context() because the disambiguation data
         // must not be calculated and cached against arbitrary repo. It's also
         // unlikely that the immutable expression contains short hashes.
-        let id_prefix_context = IdPrefixContext::new(self.revset_extensions.clone());
+        let id_prefix_context = IdPrefixContext::new(self.command.revset_extensions().clone());
         let to_rewrite_revset =
             RevsetExpression::commits(commits.into_iter().cloned().collect_vec());
         let immutable = revset_util::parse_immutable_expression(&self.revset_parse_context())
@@ -1172,7 +1260,7 @@ impl WorkspaceCommandHelper {
             })?;
         let mut expression = RevsetExpressionEvaluator::new(
             repo,
-            self.revset_extensions.clone(),
+            self.command.revset_extensions().clone(),
             &id_prefix_context,
             immutable,
         );
@@ -1226,6 +1314,9 @@ impl WorkspaceCommandHelper {
         let base_ignores = self.base_ignores()?;
 
         // Compare working-copy tree and operation with repo's, and reload as needed.
+        let fsmonitor_settings = self.settings().fsmonitor_settings()?;
+        let max_new_file_size = self.settings().max_new_file_size()?;
+        let command = self.command.clone();
         let mut locked_ws = self.workspace.start_working_copy_mutation()?;
         let old_op_id = locked_ws.locked_wc().old_operation_id().clone();
         let (repo, wc_commit) =
@@ -1266,7 +1357,7 @@ See https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#stale-workin
                         "Run `jj workspace update-stale` to recover.
 See https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#stale-working-copy \
                          for more information.",
-                    ))
+                    ));
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1274,24 +1365,27 @@ See https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#stale-workin
         let progress = crate::progress::snapshot_progress(ui);
         let new_tree_id = locked_ws.locked_wc().snapshot(SnapshotOptions {
             base_ignores,
-            fsmonitor_settings: self.settings.fsmonitor_settings()?,
+            fsmonitor_settings,
             progress: progress.as_ref().map(|x| x as _),
-            max_new_file_size: self.settings.max_new_file_size()?,
+            max_new_file_size,
         })?;
         drop(progress);
         if new_tree_id != *wc_commit.tree_id() {
-            let mut tx =
-                start_repo_transaction(&self.user_repo.repo, &self.settings, &self.string_args);
+            let mut tx = start_repo_transaction(
+                &self.user_repo.repo,
+                command.settings(),
+                command.string_args(),
+            );
             tx.set_is_snapshot(true);
             let mut_repo = tx.mut_repo();
             let commit = mut_repo
-                .rewrite_commit(&self.settings, &wc_commit)
+                .rewrite_commit(command.settings(), &wc_commit)
                 .set_tree_id(new_tree_id)
                 .write()?;
             mut_repo.set_wc_commit(workspace_id, commit.id().clone())?;
 
             // Rebase descendants
-            let num_rebased = mut_repo.rebase_descendants(&self.settings)?;
+            let num_rebased = mut_repo.rebase_descendants(command.settings())?;
             if num_rebased > 0 {
                 writeln!(
                     ui.status(),
@@ -1354,7 +1448,7 @@ See https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#stale-workin
     }
 
     pub fn start_transaction(&mut self) -> WorkspaceCommandTransaction {
-        let tx = start_repo_transaction(self.repo(), &self.settings, &self.string_args);
+        let tx = start_repo_transaction(self.repo(), self.settings(), self.command.string_args());
         let id_prefix_context = mem::take(&mut self.user_repo.id_prefix_context);
         WorkspaceCommandTransaction {
             helper: self,
@@ -1373,7 +1467,7 @@ See https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#stale-workin
             writeln!(ui.status(), "Nothing changed.")?;
             return Ok(());
         }
-        let num_rebased = tx.mut_repo().rebase_descendants(&self.settings)?;
+        let num_rebased = tx.mut_repo().rebase_descendants(self.settings())?;
         if num_rebased > 0 {
             writeln!(ui.status(), "Rebased {num_rebased} descendant commits")?;
         }
@@ -1388,7 +1482,7 @@ See https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#stale-workin
             {
                 let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
                 tx.mut_repo()
-                    .check_out(workspace_id.clone(), &self.settings, &wc_commit)?;
+                    .check_out(workspace_id.clone(), self.settings(), &wc_commit)?;
                 writeln!(
                     ui.warning_default(),
                     "The working-copy commit in workspace '{}' became immutable, so a new commit \
@@ -1433,7 +1527,7 @@ See https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#stale-workin
             }
         }
 
-        let settings = &self.settings;
+        let settings = self.settings();
         if settings.user_name().is_empty() || settings.user_email().is_empty() {
             writeln!(
                 ui.warning_default(),
@@ -1619,7 +1713,7 @@ Then run `jj squash` to move the resolution into the conflicted commit."#,
         &self,
         from: impl IntoIterator<Item = &'a CommitId>,
     ) -> Result<Vec<AdvanceableBranch>, CommandError> {
-        let ab_settings = AdvanceBranchesSettings::from_config(self.settings.config())?;
+        let ab_settings = AdvanceBranchesSettings::from_config(self.settings().config())?;
         if !ab_settings.feature_enabled() {
             // Return early if we know that there's no work to do.
             return Ok(Vec::new());
@@ -1662,7 +1756,7 @@ impl WorkspaceCommandTransaction<'_> {
     }
 
     pub fn settings(&self) -> &UserSettings {
-        &self.helper.settings
+        self.helper.settings()
     }
 
     pub fn base_repo(&self) -> &Arc<ReadonlyRepo> {
@@ -1680,7 +1774,7 @@ impl WorkspaceCommandTransaction<'_> {
 
     pub fn check_out(&mut self, commit: &Commit) -> Result<Commit, CheckOutCommitError> {
         let workspace_id = self.helper.workspace_id().to_owned();
-        let settings = &self.helper.settings;
+        let settings = self.helper.settings();
         self.id_prefix_context.take(); // invalidate
         self.tx.mut_repo().check_out(workspace_id, settings, commit)
     }
@@ -1726,7 +1820,7 @@ impl WorkspaceCommandTransaction<'_> {
             self.helper.workspace_id(),
             self.helper.revset_parse_context(),
             id_prefix_context,
-            &self.helper.commit_template_extensions,
+            &self.helper.command.data.commit_template_extensions,
         )
     }
 
@@ -2443,14 +2537,14 @@ pub struct GlobalArgs {
     /// Operation to load the repo at
     ///
     /// Operation to load the repo at. By default, Jujutsu loads the repo at the
-    /// most recent operation, or at the merge of the concurrent operations if
+    /// most recent operation, or at the merge of the divergent operations if
     /// any.
     ///
     /// You can use `--at-op=<operation ID>` to see what the repo looked like at
     /// an earlier operation. For example `jj --at-op=<operation ID> st` will
     /// show you what `jj st` would have shown you when the given operation had
     /// just finished. `--at-op=@` is pretty much the same as the default except
-    /// that concurrent operations will never be merged.
+    /// that divergent operations will never be merged.
     ///
     /// Use `jj op log` to find the operation ID you want. Any unambiguous
     /// prefix of the operation ID is enough.
@@ -2759,6 +2853,7 @@ pub struct CliRunner {
     extra_configs: Vec<config::Config>,
     store_factories: StoreFactories,
     working_copy_factories: WorkingCopyFactories,
+    workspace_loader_factory: Box<dyn WorkspaceLoaderFactory>,
     revset_extensions: RevsetExtensions,
     commit_template_extensions: Vec<Arc<dyn CommitTemplateLanguageExtension>>,
     operation_template_extensions: Vec<Arc<dyn OperationTemplateLanguageExtension>>,
@@ -2783,6 +2878,7 @@ impl CliRunner {
             extra_configs: vec![],
             store_factories: StoreFactories::default(),
             working_copy_factories: default_working_copy_factories(),
+            workspace_loader_factory: Box::new(DefaultWorkspaceLoaderFactory),
             revset_extensions: Default::default(),
             commit_template_extensions: vec![],
             operation_template_extensions: vec![],
@@ -2790,6 +2886,18 @@ impl CliRunner {
             start_hook_fns: vec![],
             process_global_args_fns: vec![],
         }
+    }
+
+    /// Set the name of the CLI application to be displayed in help messages.
+    pub fn name(mut self, name: &str) -> Self {
+        self.app = self.app.name(name.to_string());
+        self
+    }
+
+    /// Set the about message to be displayed in help messages.
+    pub fn about(mut self, about: &str) -> Self {
+        self.app = self.app.about(about.to_string());
+        self
     }
 
     /// Set the version to be displayed by `jj version`.
@@ -2816,6 +2924,14 @@ impl CliRunner {
         working_copy_factories: WorkingCopyFactories,
     ) -> Self {
         merge_factories_map(&mut self.working_copy_factories, working_copy_factories);
+        self
+    }
+
+    pub fn set_workspace_loader_factory(
+        mut self,
+        workspace_loader_factory: Box<dyn WorkspaceLoaderFactory>,
+    ) -> Self {
+        self.workspace_loader_factory = workspace_loader_factory;
         self
     }
 
@@ -2913,7 +3029,9 @@ impl CliRunner {
         // Use cwd-relative workspace configs to resolve default command and
         // aliases. WorkspaceLoader::init() won't do any heavy lifting other
         // than the path resolution.
-        let maybe_cwd_workspace_loader = WorkspaceLoader::init(find_workspace_dir(&cwd))
+        let maybe_cwd_workspace_loader = self
+            .workspace_loader_factory
+            .create(find_workspace_dir(&cwd))
             .map_err(|err| map_workspace_load_error(err, None));
         layered_configs.read_user_config()?;
         let mut repo_config_path = None;
@@ -2947,7 +3065,9 @@ impl CliRunner {
 
         let maybe_workspace_loader = if let Some(path) = &args.global_args.repository {
             // Invalid -R path is an error. No need to proceed.
-            let loader = WorkspaceLoader::init(&cwd.join(path))
+            let loader = self
+                .workspace_loader_factory
+                .create(&cwd.join(path))
                 .map_err(|err| map_workspace_load_error(err, Some(path)))?;
             layered_configs.read_repo_config(loader.repo_path())?;
             Ok(loader)
@@ -2972,7 +3092,7 @@ impl CliRunner {
         }
 
         let settings = UserSettings::from_config(config);
-        let command_helper = CommandHelper {
+        let command_helper_data = CommandHelperData {
             app: self.app,
             cwd,
             string_args,
@@ -2986,6 +3106,9 @@ impl CliRunner {
             maybe_workspace_loader,
             store_factories: self.store_factories,
             working_copy_factories: self.working_copy_factories,
+        };
+        let command_helper = CommandHelper {
+            data: Rc::new(command_helper_data),
         };
         for start_hook_fn in self.start_hook_fns {
             start_hook_fn(ui, &command_helper)?;

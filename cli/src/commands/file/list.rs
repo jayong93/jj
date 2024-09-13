@@ -16,7 +16,8 @@ use std::io::Write;
 
 use tracing::instrument;
 
-use crate::cli_util::{CommandHelper, RevisionArg};
+use crate::cli_util::CommandHelper;
+use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::ui::Ui;
 
@@ -29,23 +30,6 @@ pub(crate) struct FileListArgs {
     /// Only list files matching these prefixes (instead of all files)
     #[arg(value_hint = clap::ValueHint::AnyPath)]
     paths: Vec<String>,
-}
-
-#[instrument(skip_all)]
-pub(crate) fn deprecated_cmd_files(
-    ui: &mut Ui,
-    command: &CommandHelper,
-    args: &FileListArgs,
-) -> Result<(), CommandError> {
-    writeln!(
-        ui.warning_default(),
-        "`jj files` is deprecated; use `jj file list` instead, which is equivalent"
-    )?;
-    writeln!(
-        ui.warning_default(),
-        "`jj files` will be removed in a future version, and this will be a hard error"
-    )?;
-    cmd_file_list(ui, command, args)
 }
 
 #[instrument(skip_all)]

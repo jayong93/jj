@@ -1,19 +1,24 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use jj_lib::backend::MergedTreeId;
 use jj_lib::fsmonitor::FsmonitorSettings;
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::local_working_copy::{TreeState, TreeStateError};
+use jj_lib::local_working_copy::TreeState;
+use jj_lib::local_working_copy::TreeStateError;
 use jj_lib::matchers::Matcher;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree::TreeDiffEntry;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::store::Store;
-use jj_lib::working_copy::{CheckoutError, SnapshotOptions};
+use jj_lib::working_copy::CheckoutError;
+use jj_lib::working_copy::SnapshotOptions;
 use pollster::FutureExt;
 use tempfile::TempDir;
 use thiserror::Error;
@@ -132,7 +137,7 @@ pub(crate) fn check_out_trees(
 ) -> Result<DiffWorkingCopies, DiffCheckoutError> {
     let changed_files: Vec<_> = left_tree
         .diff_stream(right_tree, matcher)
-        .map(|(path, _diff)| path)
+        .map(|TreeDiffEntry { path, .. }| path)
         .collect()
         .block_on();
 

@@ -200,6 +200,31 @@ can override the default style with the following keys:
 ui.diff.format = "git"
 ```
 
+#### Color-words diff options
+
+In color-words diffs, changed words are displayed inline by default. Because
+it's difficult to read a diff line with many removed/added words, there's a
+threshold to switch to traditional separate-line format.
+
+* `max-inline-alternation`: Maximum number of removed/added word alternation to
+  inline. For example, `<added> ... <added>` sequence has 1 alternation, so the
+  line will be inline if `max-inline-alternation >= 1`. `<added> ... <removed>
+  ... <added>` sequence has 3 alternation.
+
+  * `0`: disable inlining, making `--color-words` more similar to `--git`
+  * `1`: inline removes-only or adds-only lines
+  * `2`, `3`, ..: inline up to `2`, `3`, .. alternation
+  * `-1`: inline all lines
+
+  The default is `3`.
+
+  **This parameter is experimental.** The definition is subject to change.
+
+```toml
+[diff.color-words]
+max-inline-alternation = 3
+```
+
 ### Generating diffs by external command
 
 If `ui.diff.tool` is set, the specified diff command will be called instead of
@@ -278,8 +303,8 @@ ui.graph.style = "square"
 The symbols used to represent commits or operations can be customized via
 templates.
 
-  * `templates.log_node` for commits (with `Option<Commit>` keywords)
-  * `templates.op_log_node` for operations (with `Operation` keywords)
+- `templates.log_node` for commits (with `Option<Commit>` keywords)
+- `templates.op_log_node` for operations (with `Operation` keywords)
 
 For example:
 ```toml
@@ -621,12 +646,12 @@ by `jj resolve`. For example:
 
 ```toml
 # Use merge-tools.meld.merge-args
-ui.merge-editor = "meld"  # Or "vscode" or "kdiff3" or "vimdiff"
+ui.merge-editor = "meld"  # Or "vscode" or "vscodium" or "kdiff3" or "vimdiff"
 # Specify merge-args inline
 ui.merge-editor = ["meld", "$left", "$base", "$right", "-o", "$output"]
 ```
 
-The "vscode", "meld", "kdiff3", and "vimdiff" tools can be used out of the box,
+The "vscode", "vscodium", "meld", "kdiff3", and "vimdiff" tools can be used out of the box,
 as long as they are installed.
 
 Using VS Code as a merge tool works well with VS Code's [Remote
@@ -784,7 +809,7 @@ sign-all = true
 backend = "ssh"
 key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGj+J6N6SO+4P8dOZqfR1oiay2yxhhHnagH52avUqw5h"
 ## You can also use a path instead of embedding the key
-# key = "/home/me/.ssh/id_for_signing.pub"
+# key = "~/.ssh/id_for_signing.pub"
 ```
 
 By default the ssh backend will look for a `ssh-keygen` binary on your path. If you want

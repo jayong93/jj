@@ -14,13 +14,20 @@
 
 use std::collections::BTreeMap;
 
-use jj_lib::op_store::{BranchTarget, RefTarget, RemoteRef, RemoteRefState, WorkspaceId};
+use jj_lib::op_store::BranchTarget;
+use jj_lib::op_store::RefTarget;
+use jj_lib::op_store::RemoteRef;
+use jj_lib::op_store::RemoteRefState;
+use jj_lib::op_store::WorkspaceId;
 use jj_lib::repo::Repo;
-use maplit::{btreemap, hashset};
+use maplit::btreemap;
+use maplit::hashset;
 use test_case::test_case;
-use testutils::{
-    commit_transactions, create_random_commit, write_random_commit, CommitGraphBuilder, TestRepo,
-};
+use testutils::commit_transactions;
+use testutils::create_random_commit;
+use testutils::write_random_commit;
+use testutils::CommitGraphBuilder;
+use testutils::TestRepo;
 
 #[test]
 fn test_heads_empty() {
@@ -74,7 +81,7 @@ fn test_heads_merge() {
 
 #[test]
 fn test_merge_views_heads() {
-    // Tests merging of the view's heads (by performing concurrent operations).
+    // Tests merging of the view's heads (by performing divergent operations).
     let settings = testutils::user_settings();
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
@@ -106,7 +113,7 @@ fn test_merge_views_heads() {
 
 #[test]
 fn test_merge_views_checkout() {
-    // Tests merging of the view's checkout (by performing concurrent operations).
+    // Tests merging of the view's checkout (by performing divergent operations).
     let settings = testutils::user_settings();
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
@@ -196,7 +203,7 @@ fn test_merge_views_checkout() {
 
 #[test]
 fn test_merge_views_branches() {
-    // Tests merging of branches (by performing concurrent operations). See
+    // Tests merging of branches (by performing divergent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
     let test_repo = TestRepo::init();
@@ -288,7 +295,7 @@ fn test_merge_views_branches() {
 
 #[test]
 fn test_merge_views_tags() {
-    // Tests merging of tags (by performing concurrent operations). See
+    // Tests merging of tags (by performing divergent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
     let test_repo = TestRepo::init();
@@ -332,7 +339,7 @@ fn test_merge_views_tags() {
 
 #[test]
 fn test_merge_views_git_refs() {
-    // Tests merging of git refs (by performing concurrent operations). See
+    // Tests merging of git refs (by performing divergent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
     let test_repo = TestRepo::init();
@@ -388,7 +395,7 @@ fn test_merge_views_git_refs() {
 
 #[test]
 fn test_merge_views_git_heads() {
-    // Tests merging of git heads (by performing concurrent operations). See
+    // Tests merging of git heads (by performing divergent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
     let test_repo = TestRepo::init();

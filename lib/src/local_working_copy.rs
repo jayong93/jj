@@ -18,19 +18,28 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::error::Error;
-use std::fs::{File, Metadata, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
+use std::fs::File;
+use std::fs::Metadata;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::io::Write;
+use std::iter;
+use std::mem;
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use std::path::Path;
+use std::path::PathBuf;
+use std::slice;
+use std::sync::mpsc::channel;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
-use std::{fs, iter, mem, slice};
 
 use futures::StreamExt;
-use itertools::{EitherOrBoth, Itertools};
+use itertools::EitherOrBoth;
+use itertools::Itertools;
 use once_cell::unsync::OnceCell;
 use pollster::FutureExt;
 use prost::Message;
@@ -38,35 +47,62 @@ use rayon::iter::IntoParallelIterator;
 use rayon::prelude::ParallelIterator;
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use tracing::{instrument, trace_span};
+use tracing::instrument;
+use tracing::trace_span;
 
-use crate::backend::{
-    BackendError, BackendResult, FileId, MergedTreeId, MillisSinceEpoch, SymlinkId, TreeId,
-    TreeValue,
-};
+use crate::backend::BackendError;
+use crate::backend::BackendResult;
+use crate::backend::FileId;
+use crate::backend::MergedTreeId;
+use crate::backend::MillisSinceEpoch;
+use crate::backend::SymlinkId;
+use crate::backend::TreeId;
+use crate::backend::TreeValue;
 use crate::commit::Commit;
-use crate::conflicts::{self, materialize_tree_value, MaterializedTreeValue};
-use crate::file_util::{check_symlink_support, try_symlink};
+use crate::conflicts;
+use crate::conflicts::materialize_merge_result;
+use crate::conflicts::materialize_tree_value;
+use crate::conflicts::MaterializedTreeValue;
+use crate::file_util::check_symlink_support;
+use crate::file_util::try_symlink;
+#[cfg(feature = "watchman")]
+use crate::fsmonitor::watchman;
 use crate::fsmonitor::FsmonitorSettings;
 #[cfg(feature = "watchman")]
-use crate::fsmonitor::{watchman, WatchmanConfig};
+use crate::fsmonitor::WatchmanConfig;
 use crate::gitignore::GitIgnoreFile;
 use crate::lock::FileLock;
-use crate::matchers::{
-    DifferenceMatcher, EverythingMatcher, FilesMatcher, IntersectionMatcher, Matcher, PrefixMatcher,
-};
-use crate::merge::{Merge, MergeBuilder, MergedTreeValue};
-use crate::merged_tree::{MergedTree, MergedTreeBuilder};
+use crate::matchers::DifferenceMatcher;
+use crate::matchers::EverythingMatcher;
+use crate::matchers::FilesMatcher;
+use crate::matchers::IntersectionMatcher;
+use crate::matchers::Matcher;
+use crate::matchers::PrefixMatcher;
+use crate::merge::Merge;
+use crate::merge::MergeBuilder;
+use crate::merge::MergedTreeValue;
+use crate::merged_tree::MergedTree;
+use crate::merged_tree::MergedTreeBuilder;
+use crate::merged_tree::TreeDiffEntry;
 use crate::object_id::ObjectId;
-use crate::op_store::{OperationId, WorkspaceId};
-use crate::repo_path::{RepoPath, RepoPathBuf, RepoPathComponent};
+use crate::op_store::OperationId;
+use crate::op_store::WorkspaceId;
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
+use crate::repo_path::RepoPathComponent;
 use crate::settings::HumanByteSize;
 use crate::store::Store;
 use crate::tree::Tree;
-use crate::working_copy::{
-    CheckoutError, CheckoutStats, LockedWorkingCopy, ResetError, SnapshotError, SnapshotOptions,
-    SnapshotProgress, WorkingCopy, WorkingCopyFactory, WorkingCopyStateError,
-};
+use crate::working_copy::CheckoutError;
+use crate::working_copy::CheckoutStats;
+use crate::working_copy::LockedWorkingCopy;
+use crate::working_copy::ResetError;
+use crate::working_copy::SnapshotError;
+use crate::working_copy::SnapshotOptions;
+use crate::working_copy::SnapshotProgress;
+use crate::working_copy::WorkingCopy;
+use crate::working_copy::WorkingCopyFactory;
+use crate::working_copy::WorkingCopyStateError;
 
 #[cfg(unix)]
 type FileExecutableFlag = bool;
@@ -543,11 +579,9 @@ impl TreeState {
 
     fn empty(store: Arc<Store>, working_copy_path: PathBuf, state_path: PathBuf) -> TreeState {
         let tree_id = store.empty_merged_tree_id();
-        // Canonicalize the working copy path because "repo/." makes libgit2 think that
-        // everything should be ignored
         TreeState {
             store,
-            working_copy_path: working_copy_path.canonicalize().unwrap(),
+            working_copy_path,
             state_path,
             tree_id,
             file_states: FileStatesMap::new(),
@@ -1315,7 +1349,7 @@ impl TreeState {
         let new_matcher = PrefixMatcher::new(&sparse_patterns);
         let added_matcher = DifferenceMatcher::new(&new_matcher, &old_matcher);
         let removed_matcher = DifferenceMatcher::new(&old_matcher, &new_matcher);
-        let empty_tree = MergedTree::resolved(Tree::null(self.store.clone(), RepoPathBuf::root()));
+        let empty_tree = MergedTree::resolved(Tree::empty(self.store.clone(), RepoPathBuf::root()));
         let added_stats = self.update(&empty_tree, &tree, &added_matcher).block_on()?;
         let removed_stats = self
             .update(&tree, &empty_tree, &removed_matcher)
@@ -1353,8 +1387,8 @@ impl TreeState {
         let mut diff_stream = Box::pin(
             old_tree
                 .diff_stream(new_tree, matcher)
-                .map(|(path, diff)| async {
-                    match diff {
+                .map(|TreeDiffEntry { path, values }| async {
+                    match values {
                         Ok((before, after)) => {
                             let result = materialize_tree_value(&self.store, &path, after).await;
                             (path, result.map(|value| (before.is_present(), value)))
@@ -1422,11 +1456,23 @@ impl TreeState {
                 MaterializedTreeValue::Tree(_) => {
                     panic!("unexpected tree entry in diff at {path:?}");
                 }
-                MaterializedTreeValue::Conflict {
+                MaterializedTreeValue::FileConflict {
                     id: _,
                     contents,
                     executable,
-                } => self.write_conflict(&disk_path, contents, executable)?,
+                } => {
+                    let mut data = vec![];
+                    materialize_merge_result(&contents, &mut data)
+                        .expect("Failed to materialize conflict to in-memory buffer");
+                    self.write_conflict(&disk_path, data, executable)?
+                }
+                MaterializedTreeValue::OtherConflict { id } => {
+                    // Unless all terms are regular files, we can't do much
+                    // better than trying to describe the merge.
+                    let data = id.describe().into_bytes();
+                    let executable = false;
+                    self.write_conflict(&disk_path, data, executable)?
+                }
             };
             changed_file_states.push((path, file_state));
         }
@@ -1447,8 +1493,8 @@ impl TreeState {
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
         let mut diff_stream = old_tree.diff_stream(new_tree, matcher.as_ref());
-        while let Some((path, diff)) = diff_stream.next().await {
-            let (_before, after) = diff?;
+        while let Some(TreeDiffEntry { path, values }) = diff_stream.next().await {
+            let (_before, after) = values?;
             if after.is_absent() {
                 deleted_files.insert(path);
             } else {
@@ -1527,10 +1573,6 @@ impl WorkingCopy for LocalWorkingCopy {
 
     fn name(&self) -> &str {
         Self::name()
-    }
-
-    fn path(&self) -> &Path {
-        &self.working_copy_path
     }
 
     fn workspace_id(&self) -> &WorkspaceId {

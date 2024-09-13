@@ -17,10 +17,12 @@ use std::collections::HashMap;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use jj_lib::backend::CommitId;
-use jj_lib::commit::{Commit, CommitIteratorExt};
+use jj_lib::commit::Commit;
+use jj_lib::commit::CommitIteratorExt;
 use tracing::instrument;
 
-use crate::cli_util::{CommandHelper, RevisionArg};
+use crate::cli_util::CommandHelper;
+use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::ui::Ui;
 
@@ -111,7 +113,7 @@ pub(crate) fn cmd_parallelize(
             // Commits in the target set do not depend on each other but they still depend
             // on other parents
             if let Some(new_parents) = new_target_parents.get(rewriter.old_commit().id()) {
-                rewriter.set_new_rewritten_parents(new_parents.clone());
+                rewriter.set_new_rewritten_parents(new_parents);
             } else if rewriter
                 .old_commit()
                 .parent_ids()
@@ -126,7 +128,7 @@ pub(crate) fn cmd_parallelize(
                         new_parents.push(parent.clone());
                     }
                 }
-                rewriter.set_new_rewritten_parents(new_parents);
+                rewriter.set_new_rewritten_parents(&new_parents);
             }
             if rewriter.parents_changed() {
                 let builder = rewriter.rebase(command.settings())?;

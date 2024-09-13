@@ -39,6 +39,7 @@ This document contains the help content for the `jj` command-line program.
 * [`jj file chmod`↴](#jj-file-chmod)
 * [`jj file list`↴](#jj-file-list)
 * [`jj file show`↴](#jj-file-show)
+* [`jj file untrack`↴](#jj-file-untrack)
 * [`jj fix`↴](#jj-fix)
 * [`jj git`↴](#jj-git)
 * [`jj git clone`↴](#jj-git-clone)
@@ -91,7 +92,6 @@ This document contains the help content for the `jj` command-line program.
 * [`jj util config-schema`↴](#jj-util-config-schema)
 * [`jj undo`↴](#jj-undo)
 * [`jj unsquash`↴](#jj-unsquash)
-* [`jj untrack`↴](#jj-untrack)
 * [`jj version`↴](#jj-version)
 * [`jj workspace`↴](#jj-workspace)
 * [`jj workspace add`↴](#jj-workspace-add)
@@ -145,7 +145,6 @@ To get started, see the tutorial at https://github.com/martinvonz/jj/blob/main/d
 * `util` — Infrequently used commands such as for generating shell completions
 * `undo` — Undo an operation (shortcut for `jj op undo`)
 * `unsquash` — Move changes from a revision's parent into the revision
-* `untrack` — Stop tracking specified paths in the working copy
 * `version` — Display version information
 * `workspace` — Commands for working with workspaces
 
@@ -166,9 +165,9 @@ To get started, see the tutorial at https://github.com/martinvonz/jj/blob/main/d
    This option only affects the check. It does not affect the `immutable_heads()` revset or the `immutable` template keyword.
 * `--at-operation <AT_OPERATION>` — Operation to load the repo at
 
-   Operation to load the repo at. By default, Jujutsu loads the repo at the most recent operation, or at the merge of the concurrent operations if any.
+   Operation to load the repo at. By default, Jujutsu loads the repo at the most recent operation, or at the merge of the divergent operations if any.
 
-   You can use `--at-op=<operation ID>` to see what the repo looked like at an earlier operation. For example `jj --at-op=<operation ID> st` will show you what `jj st` would have shown you when the given operation had just finished. `--at-op=@` is pretty much the same as the default except that concurrent operations will never be merged.
+   You can use `--at-op=<operation ID>` to see what the repo looked like at an earlier operation. For example `jj --at-op=<operation ID> st` will show you what `jj st` would have shown you when the given operation had just finished. `--at-op=@` is pretty much the same as the default except that divergent operations will never be merged.
 
    Use `jj op log` to find the operation ID you want. Any unambiguous prefix of the operation ID is enough.
 
@@ -704,6 +703,7 @@ File operations
 * `chmod` — Sets or removes the executable bit for paths in the repo
 * `list` — List files in a revision
 * `show` — Print contents of files in a revision
+* `untrack` — Stop tracking specified paths in the working copy
 
 
 
@@ -773,6 +773,20 @@ If the given path is a directory, files in the directory will be visited recursi
 
 
 
+## `jj file untrack`
+
+Stop tracking specified paths in the working copy
+
+**Usage:** `jj file untrack <PATHS>...`
+
+###### **Arguments:**
+
+* `<PATHS>` — Paths to untrack. They must already be ignored.
+
+   The paths could be ignored via a .gitignore or .git/info/exclude (in colocated repos).
+
+
+
 ## `jj fix`
 
 Update files with formatting fixes or other changes
@@ -809,8 +823,9 @@ the values have the following properties:
 
 For example, the following configuration defines how two code formatters
 (`clang-format` and `black`) will apply to three different file extensions
-(.cc, .h, and .py):
+(`.cc`, `.h`, and `.py`):
 
+```toml
 [fix.tools.clang-format]
 command = ["/usr/bin/clang-format", "--assume-filename=$path"]
 patterns = ["glob:'**/*.cc'",
@@ -819,6 +834,7 @@ patterns = ["glob:'**/*.cc'",
 [fix.tools.black]
 command = ["/usr/bin/black", "-", "--stdin-filename=$path"]
 patterns = ["glob:'**/*.py'"]
+```
 
 Execution order of tools that affect the same file is deterministic, but
 currently unspecified, and may change between releases. If two tools affect
@@ -830,8 +846,10 @@ command that will affect all changed files in the specified revisions. For
 example, the following configuration would apply the Rust formatter to all
 changed files (whether they are Rust files or not):
 
+```toml
 [fix]
 tool-command = ["rustfmt", "--emit", "stdout"]
+```
 
 The tool defined by `tool-command` acts as if it was the first entry in
 `fix.tools`, and uses `pattern = "all()"``. Support for `tool-command`
@@ -1226,6 +1244,11 @@ implied.
 ###### **Options:**
 
 * `-e`, `--edit` — Instead of creating a new working-copy commit on top of the target commit (like `jj new`), edit the target commit directly (like `jj edit`)
+
+   Takes precedence over config in `ui.movement.edit`; i.e. will negate `ui.movement.edit = false`
+* `-n`, `--no-edit` — The inverse of `--edit`
+
+   Takes precedence over config in `ui.movement.edit`; i.e. will negate `ui.movement.edit = true`
 * `--conflict` — Jump to the next conflicted descendant
 
 
@@ -1339,7 +1362,7 @@ Compare changes to the repository between two operations
 
 Show the operation log
 
-Like other commands, `jj op log` snapshots the current working-copy changes and merges concurrent operations. Use `--at-op=@ --ignore-working-copy` to inspect the current state without mutation.
+Like other commands, `jj op log` snapshots the current working-copy changes and reconciles divergent operations. Use `--at-op=@ --ignore-working-copy` to inspect the current state without mutation.
 
 **Usage:** `jj operation log [OPTIONS]`
 
@@ -1517,7 +1540,7 @@ B        B
 A        A
 ```
 If the working copy revision already has visible children, then `--edit` is
-implied.
+implied
 
 **Usage:** `jj prev [OPTIONS] [OFFSET]`
 
@@ -1530,6 +1553,11 @@ implied.
 ###### **Options:**
 
 * `-e`, `--edit` — Edit the parent directly, instead of moving the working-copy commit
+
+   Takes precedence over config in `ui.movement.edit`; i.e. will negate `ui.movement.edit = false`
+* `-n`, `--no-edit` — The inverse of `--edit`
+
+   Takes precedence over config in `ui.movement.edit`; i.e. will negate `ui.movement.edit = true`
 * `--conflict` — Jump to the previous conflicted ancestor
 
 
@@ -2054,20 +2082,6 @@ If a working-copy commit gets abandoned, it will be given a new, empty commit. T
   Default value: `@`
 * `-i`, `--interactive` — Interactively choose which parts to unsquash
 * `--tool <NAME>` — Specify diff editor to be used (implies --interactive)
-
-
-
-## `jj untrack`
-
-Stop tracking specified paths in the working copy
-
-**Usage:** `jj untrack <PATHS>...`
-
-###### **Arguments:**
-
-* `<PATHS>` — Paths to untrack. They must already be ignored.
-
-   The paths could be ignored via a .gitignore or .git/info/exclude (in colocated repos).
 
 
 

@@ -17,8 +17,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::backend::{self, BackendResult, TreeId, TreeValue};
-use crate::repo_path::{RepoPath, RepoPathBuf};
+use crate::backend;
+use crate::backend::BackendResult;
+use crate::backend::TreeId;
+use crate::backend::TreeValue;
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::store::Store;
 use crate::tree::Tree;
 
@@ -136,7 +140,7 @@ impl TreeBuilder {
             let (parent, basename) = dir.split().expect("root must be populated");
             let tree = populate_trees(tree_cache, store, parent)?
                 .sub_tree(basename)?
-                .unwrap_or_else(|| Tree::null(store.clone(), dir.to_owned()));
+                .unwrap_or_else(|| Tree::empty(store.clone(), dir.to_owned()));
             Ok(tree_cache.entry(dir.to_owned()).or_insert(tree))
         }
 

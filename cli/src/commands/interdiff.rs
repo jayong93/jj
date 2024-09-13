@@ -18,7 +18,8 @@ use clap::ArgGroup;
 use jj_lib::rewrite::rebase_to_dest_parent;
 use tracing::instrument;
 
-use crate::cli_util::{CommandHelper, RevisionArg};
+use crate::cli_util::CommandHelper;
+use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::diff_util::DiffFormatArgs;
 use crate::ui::Ui;
@@ -72,6 +73,7 @@ pub(crate) fn cmd_interdiff(
         &from_tree,
         &to_tree,
         matcher.as_ref(),
+        &Default::default(),
         ui.term_width(),
     )?;
     Ok(())

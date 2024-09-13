@@ -18,28 +18,48 @@ use std::path::Path;
 use assert_matches::assert_matches;
 use chrono::DateTime;
 use itertools::Itertools;
-use jj_lib::backend::{CommitId, MillisSinceEpoch, Signature, Timestamp};
+use jj_lib::backend::CommitId;
+use jj_lib::backend::MillisSinceEpoch;
+use jj_lib::backend::Signature;
+use jj_lib::backend::Timestamp;
 use jj_lib::commit::Commit;
 use jj_lib::fileset::FilesetExpression;
 use jj_lib::git;
 use jj_lib::git_backend::GitBackend;
-use jj_lib::graph::{GraphEdge, ReverseGraphIterator};
+use jj_lib::graph::GraphEdge;
+use jj_lib::graph::ReverseGraphIterator;
 use jj_lib::object_id::ObjectId;
-use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState, WorkspaceId};
+use jj_lib::op_store::RefTarget;
+use jj_lib::op_store::RemoteRef;
+use jj_lib::op_store::RemoteRefState;
+use jj_lib::op_store::WorkspaceId;
 use jj_lib::repo::Repo;
-use jj_lib::repo_path::{RepoPath, RepoPathUiConverter};
-use jj_lib::revset::{
-    optimize, parse, DefaultSymbolResolver, FailingSymbolResolver, ResolvedExpression, Revset,
-    RevsetAliasesMap, RevsetExpression, RevsetExtensions, RevsetFilterPredicate,
-    RevsetParseContext, RevsetResolutionError, RevsetWorkspaceContext, SymbolResolverExtension,
-};
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathUiConverter;
+use jj_lib::revset::optimize;
+use jj_lib::revset::parse;
+use jj_lib::revset::DefaultSymbolResolver;
+use jj_lib::revset::FailingSymbolResolver;
+use jj_lib::revset::ResolvedExpression;
+use jj_lib::revset::Revset;
+use jj_lib::revset::RevsetAliasesMap;
+use jj_lib::revset::RevsetExpression;
+use jj_lib::revset::RevsetExtensions;
+use jj_lib::revset::RevsetFilterPredicate;
+use jj_lib::revset::RevsetParseContext;
+use jj_lib::revset::RevsetResolutionError;
+use jj_lib::revset::RevsetWorkspaceContext;
+use jj_lib::revset::SymbolResolverExtension;
 use jj_lib::settings::GitSettings;
 use jj_lib::workspace::Workspace;
 use test_case::test_case;
-use testutils::{
-    create_random_commit, create_tree, write_random_commit, CommitGraphBuilder, TestRepo,
-    TestRepoBackend, TestWorkspace,
-};
+use testutils::create_random_commit;
+use testutils::create_tree;
+use testutils::write_random_commit;
+use testutils::CommitGraphBuilder;
+use testutils::TestRepo;
+use testutils::TestRepoBackend;
+use testutils::TestWorkspace;
 
 fn resolve_symbol_with_extensions(
     repo: &dyn Repo,
@@ -3312,6 +3332,80 @@ fn test_evaluate_expression_diff_contains() {
             "diff_contains('', {blank_clean_inserted_clean:?})",
         )),
         vec![commit3.id().clone(), commit1.id().clone()]
+    );
+}
+
+#[test]
+fn test_evaluate_expression_file_merged_parents() {
+    let settings = testutils::user_settings();
+    let test_workspace = TestWorkspace::init(&settings);
+    let repo = &test_workspace.repo;
+
+    let mut tx = repo.start_transaction(&settings);
+    let mut_repo = tx.mut_repo();
+
+    // file2 can be merged automatically, file1 can't.
+    let file_path1 = RepoPath::from_internal_string("file1");
+    let file_path2 = RepoPath::from_internal_string("file2");
+    let tree1 = create_tree(repo, &[(file_path1, "1\n"), (file_path2, "1\n")]);
+    let tree2 = create_tree(repo, &[(file_path1, "1\n2\n"), (file_path2, "2\n1\n")]);
+    let tree3 = create_tree(repo, &[(file_path1, "1\n3\n"), (file_path2, "1\n3\n")]);
+    let tree4 = create_tree(repo, &[(file_path1, "1\n4\n"), (file_path2, "2\n1\n3\n")]);
+
+    let mut create_commit = |parent_ids, tree_id| {
+        mut_repo
+            .new_commit(&settings, parent_ids, tree_id)
+            .write()
+            .unwrap()
+    };
+    let commit1 = create_commit(vec![repo.store().root_commit_id().clone()], tree1.id());
+    let commit2 = create_commit(vec![commit1.id().clone()], tree2.id());
+    let commit3 = create_commit(vec![commit1.id().clone()], tree3.id());
+    let commit4 = create_commit(vec![commit2.id().clone(), commit3.id().clone()], tree4.id());
+
+    let query = |revset_str: &str| {
+        resolve_commit_ids_in_workspace(
+            mut_repo,
+            revset_str,
+            &test_workspace.workspace,
+            Some(test_workspace.workspace.workspace_root()),
+        )
+    };
+
+    assert_eq!(
+        query("file('file1')"),
+        vec![
+            commit4.id().clone(),
+            commit3.id().clone(),
+            commit2.id().clone(),
+            commit1.id().clone(),
+        ]
+    );
+    assert_eq!(
+        query("file('file2')"),
+        vec![
+            commit3.id().clone(),
+            commit2.id().clone(),
+            commit1.id().clone(),
+        ]
+    );
+
+    assert_eq!(
+        query("diff_contains(regex:'[1234]', 'file1')"),
+        vec![
+            commit4.id().clone(),
+            commit3.id().clone(),
+            commit2.id().clone(),
+            commit1.id().clone(),
+        ]
+    );
+    assert_eq!(
+        query("diff_contains(regex:'[1234]', 'file2')"),
+        vec![
+            commit3.id().clone(),
+            commit2.id().clone(),
+            commit1.id().clone(),
+        ]
     );
 }
 

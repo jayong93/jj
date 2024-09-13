@@ -15,36 +15,52 @@
 #![allow(missing_docs)]
 
 use std::any::Any;
-use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::io::Read;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
+use clru::CLruCache;
 use futures::stream::BoxStream;
 use pollster::FutureExt;
 
-use crate::backend::{
-    self, Backend, BackendResult, ChangeId, CommitId, ConflictId, CopyRecord, FileId, MergedTreeId,
-    SigningFn, SymlinkId, TreeId,
-};
+use crate::backend;
+use crate::backend::Backend;
+use crate::backend::BackendResult;
+use crate::backend::ChangeId;
+use crate::backend::CommitId;
+use crate::backend::ConflictId;
+use crate::backend::CopyRecord;
+use crate::backend::FileId;
+use crate::backend::MergedTreeId;
+use crate::backend::SigningFn;
+use crate::backend::SymlinkId;
+use crate::backend::TreeId;
 use crate::commit::Commit;
 use crate::index::Index;
-use crate::merge::{Merge, MergedTreeValue};
+use crate::merge::Merge;
+use crate::merge::MergedTreeValue;
 use crate::merged_tree::MergedTree;
-use crate::repo_path::{RepoPath, RepoPathBuf};
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::signing::Signer;
 use crate::tree::Tree;
 use crate::tree_builder::TreeBuilder;
+
+// There are more tree objects than commits, and trees are often shared across
+// commits.
+const COMMIT_CACHE_CAPACITY: usize = 100;
+const TREE_CACHE_CAPACITY: usize = 1000;
 
 /// Wraps the low-level backend and makes it return more convenient types. Also
 /// adds caching.
 pub struct Store {
     backend: Box<dyn Backend>,
     signer: Signer,
-    commit_cache: RwLock<HashMap<CommitId, Arc<backend::Commit>>>,
-    tree_cache: RwLock<HashMap<(RepoPathBuf, TreeId), Arc<backend::Tree>>>,
-    use_tree_conflict_format: bool,
+    commit_cache: Mutex<CLruCache<CommitId, Arc<backend::Commit>>>,
+    tree_cache: Mutex<CLruCache<(RepoPathBuf, TreeId), Arc<backend::Tree>>>,
 }
 
 impl Debug for Store {
@@ -56,17 +72,12 @@ impl Debug for Store {
 }
 
 impl Store {
-    pub fn new(
-        backend: Box<dyn Backend>,
-        signer: Signer,
-        use_tree_conflict_format: bool,
-    ) -> Arc<Self> {
+    pub fn new(backend: Box<dyn Backend>, signer: Signer) -> Arc<Self> {
         Arc::new(Store {
             backend,
             signer,
-            commit_cache: Default::default(),
-            tree_cache: Default::default(),
-            use_tree_conflict_format,
+            commit_cache: Mutex::new(CLruCache::new(COMMIT_CACHE_CAPACITY.try_into().unwrap())),
+            tree_cache: Mutex::new(CLruCache::new(TREE_CACHE_CAPACITY.try_into().unwrap())),
         })
     }
 
@@ -78,18 +89,13 @@ impl Store {
         &self.signer
     }
 
-    /// Whether new tree should be written using the tree-level format.
-    pub fn use_tree_conflict_format(&self) -> bool {
-        self.use_tree_conflict_format
-    }
-
     pub fn get_copy_records(
         &self,
-        paths: &[RepoPathBuf],
-        roots: &[CommitId],
-        heads: &[CommitId],
+        paths: Option<&[RepoPathBuf]>,
+        root: &CommitId,
+        head: &CommitId,
     ) -> BackendResult<BoxStream<BackendResult<CopyRecord>>> {
-        self.backend.get_copy_records(paths, roots, heads)
+        self.backend.get_copy_records(paths, root, head)
     }
 
     pub fn commit_id_length(&self) -> usize {
@@ -135,15 +141,15 @@ impl Store {
 
     async fn get_backend_commit(&self, id: &CommitId) -> BackendResult<Arc<backend::Commit>> {
         {
-            let read_locked_cached = self.commit_cache.read().unwrap();
-            if let Some(data) = read_locked_cached.get(id).cloned() {
+            let mut locked_cache = self.commit_cache.lock().unwrap();
+            if let Some(data) = locked_cache.get(id).cloned() {
                 return Ok(data);
             }
         }
         let commit = self.backend.read_commit(id).await?;
         let data = Arc::new(commit);
-        let mut write_locked_cache = self.commit_cache.write().unwrap();
-        write_locked_cache.insert(id.clone(), data.clone());
+        let mut locked_cache = self.commit_cache.lock().unwrap();
+        locked_cache.put(id.clone(), data.clone());
         Ok(data)
     }
 
@@ -157,8 +163,8 @@ impl Store {
         let (commit_id, commit) = self.backend.write_commit(commit, sign_with)?;
         let data = Arc::new(commit);
         {
-            let mut write_locked_cache = self.commit_cache.write().unwrap();
-            write_locked_cache.insert(commit_id.clone(), data.clone());
+            let mut locked_cache = self.commit_cache.lock().unwrap();
+            locked_cache.put(commit_id.clone(), data.clone());
         }
 
         Ok(Commit::new(self.clone(), commit_id, data))
@@ -184,15 +190,15 @@ impl Store {
     ) -> BackendResult<Arc<backend::Tree>> {
         let key = (dir.to_owned(), id.clone());
         {
-            let read_locked_cache = self.tree_cache.read().unwrap();
-            if let Some(data) = read_locked_cache.get(&key).cloned() {
+            let mut locked_cache = self.tree_cache.lock().unwrap();
+            if let Some(data) = locked_cache.get(&key).cloned() {
                 return Ok(data);
             }
         }
         let data = self.backend.read_tree(dir, id).await?;
         let data = Arc::new(data);
-        let mut write_locked_cache = self.tree_cache.write().unwrap();
-        write_locked_cache.insert(key, data.clone());
+        let mut locked_cache = self.tree_cache.lock().unwrap();
+        locked_cache.put(key, data.clone());
         Ok(data)
     }
 
@@ -200,11 +206,11 @@ impl Store {
         match &id {
             MergedTreeId::Legacy(id) => {
                 let tree = self.get_tree(RepoPath::root(), id)?;
-                Ok(MergedTree::Legacy(tree))
+                MergedTree::from_legacy_tree(tree)
             }
             MergedTreeId::Merge(ids) => {
                 let trees = ids.try_map(|id| self.get_tree(RepoPath::root(), id))?;
-                Ok(MergedTree::Merge(trees))
+                Ok(MergedTree::new(trees))
             }
         }
     }
@@ -217,8 +223,8 @@ impl Store {
         let tree_id = self.backend.write_tree(path, &tree)?;
         let data = Arc::new(tree);
         {
-            let mut write_locked_cache = self.tree_cache.write().unwrap();
-            write_locked_cache.insert((path.to_owned(), tree_id.clone()), data.clone());
+            let mut locked_cache = self.tree_cache.lock().unwrap();
+            locked_cache.put((path.to_owned(), tree_id.clone()), data.clone());
         }
 
         Ok(Tree::new(self.clone(), path.to_owned(), tree_id, data))

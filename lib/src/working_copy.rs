@@ -17,17 +17,21 @@
 
 use std::any::Any;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::backend::{BackendError, MergedTreeId};
+use crate::backend::BackendError;
+use crate::backend::MergedTreeId;
 use crate::commit::Commit;
 use crate::fsmonitor::FsmonitorSettings;
-use crate::gitignore::{GitIgnoreError, GitIgnoreFile};
-use crate::op_store::{OperationId, WorkspaceId};
-use crate::repo_path::{RepoPath, RepoPathBuf};
+use crate::gitignore::GitIgnoreError;
+use crate::gitignore::GitIgnoreFile;
+use crate::op_store::OperationId;
+use crate::op_store::WorkspaceId;
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::settings::HumanByteSize;
 use crate::store::Store;
 
@@ -39,9 +43,6 @@ pub trait WorkingCopy: Send {
     /// The name/id of the implementation. Used for choosing the right
     /// implementation when loading a working copy.
     fn name(&self) -> &str;
-
-    /// The working copy's root directory.
-    fn path(&self) -> &Path;
 
     /// The working copy's workspace ID.
     fn workspace_id(&self) -> &WorkspaceId;

@@ -14,25 +14,37 @@
 
 #![allow(missing_docs)]
 
-use std::fmt::{Debug, Error, Formatter};
-use std::hash::{Hash, Hasher};
+use std::fmt::Debug;
+use std::fmt::Error;
+use std::fmt::Formatter;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::io::Read;
 use std::sync::Arc;
 
 use itertools::Itertools;
 use tracing::instrument;
 
-use crate::backend::{
-    BackendError, BackendResult, ConflictId, TreeEntriesNonRecursiveIterator, TreeEntry, TreeId,
-    TreeValue,
-};
+use crate::backend;
+use crate::backend::BackendError;
+use crate::backend::BackendResult;
+use crate::backend::ConflictId;
+use crate::backend::TreeEntriesNonRecursiveIterator;
+use crate::backend::TreeEntry;
+use crate::backend::TreeId;
+use crate::backend::TreeValue;
+use crate::files;
 use crate::files::MergeResult;
-use crate::matchers::{EverythingMatcher, Matcher};
-use crate::merge::{trivial_merge, Merge, MergedTreeValue};
+use crate::matchers::EverythingMatcher;
+use crate::matchers::Matcher;
+use crate::merge::trivial_merge;
+use crate::merge::Merge;
+use crate::merge::MergedTreeVal;
 use crate::object_id::ObjectId;
-use crate::repo_path::{RepoPath, RepoPathBuf, RepoPathComponent};
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
+use crate::repo_path::RepoPathComponent;
 use crate::store::Store;
-use crate::{backend, files};
 
 #[derive(Clone)]
 pub struct Tree {
@@ -76,11 +88,12 @@ impl Tree {
         }
     }
 
-    pub fn null(store: Arc<Store>, dir: RepoPathBuf) -> Self {
+    pub fn empty(store: Arc<Store>, dir: RepoPathBuf) -> Self {
+        let id = store.empty_tree_id().clone();
         Tree {
             store,
             dir,
-            id: TreeId::new(vec![]),
+            id,
             data: Arc::new(backend::Tree::default()),
         }
     }
@@ -381,8 +394,9 @@ fn merge_tree_value(
             match merge.into_resolved() {
                 Ok(value) => value,
                 Err(conflict) => {
+                    let conflict_borrowed = conflict.map(|value| value.as_ref());
                     if let Some(tree_value) =
-                        try_resolve_file_conflict(store, &filename, &conflict)?
+                        try_resolve_file_conflict(store, &filename, &conflict_borrowed)?
                     {
                         Some(tree_value)
                     } else {
@@ -402,7 +416,7 @@ fn merge_tree_value(
 pub fn try_resolve_file_conflict(
     store: &Store,
     filename: &RepoPath,
-    conflict: &MergedTreeValue,
+    conflict: &MergedTreeVal,
 ) -> BackendResult<Option<TreeValue>> {
     // If there are any non-file or any missing parts in the conflict, we can't
     // merge it. We check early so we don't waste time reading file contents if
@@ -457,7 +471,7 @@ pub fn try_resolve_file_conflict(
     let merge_result = files::merge(&contents);
     match merge_result {
         MergeResult::Resolved(merged_content) => {
-            let id = store.write_file(filename, &mut merged_content.0.as_slice())?;
+            let id = store.write_file(filename, &mut merged_content.as_slice())?;
             Ok(Some(TreeValue::File { id, executable }))
         }
         MergeResult::Conflict(_) => Ok(None),

@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
 ## [Unreleased]
 
 ### Breaking changes
@@ -15,6 +16,64 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New features
 
 ### Fixed bugs
+
+## [0.21.0] - 2024-09-04
+
+### Breaking changes
+
+* `next/prev` will no longer infer when to go into edit mode when moving from
+  commit to commit. It now either follows the flags `--edit|--no-edit` or it
+  gets the mode from `ui.movement.edit`.
+
+### Deprecations
+
+* `jj untrack` has been renamed to `jj file untrack`.
+
+### New features
+
+* Add new boolean config knob, `ui.movement.edit` for controlling the behaviour
+  of `prev/next`. The flag turns `edit` mode `on` and `off` permanently when set
+  respectively to `true` or `false`.
+
+* All diff formats except `--name-only` now include information about copies and
+  moves. So do external diff tools in file-by-file mode. `jj status` also
+  includes information about copies and moves.
+
+* Color-words diff has gained [an option to display complex changes as separate
+  lines](docs/config.md#color-words-diff-options). It's enabled by default. To
+  restore the old behavior, set `diff.color-words.max-inline-alternation = -1`.
+
+* A tilde (`~`) at the start of the path will now be expanded to the user's home
+  directory when configuring a `signing.key` for SSH commit signing.
+  
+* When reconfiguring the author, warn that the working copy won't be updated
+
+### Fixed bugs
+
+* Release binaries for Intel Macs have been restored. They were previously
+  broken due to using a sunset version of GitHub's macOS runners (but nobody had
+  previously complained.)
+
+### Contributors
+
+Thanks to the people who made this release happen!
+
+* Aaron Bull Schaefer (@elasticdog)
+* Austin Seipp (@thoughtpolice)
+* Benjamin Tan (@bnjmnt4n)
+* Raniz Daniel Raneland (@Raniz85)
+* Daniel Ploch (@torquestomp)
+* Essien Ita Essien (@essiene)
+* Ilya Grigoriev (@ilyagr)
+* Kaleb Pace (@kalebpace)
+* Marie (@NyCodeGHG)
+* Marijan Smetko (@InCogNiTo124)
+* Martin von Zweigbergk (@martinvonz)
+* Matt Kulukundis (@fowles)
+* Scott Taylor (@scott2000)
+* Stephen Jennings (@jennings)
+* tingerrr (@tingerrr)
+* Yuya Nishihara (@yuja)
 
 ## [0.20.0] - 2024-08-07
 
@@ -58,6 +117,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   These can be used in combination for now. See `jj help fix` for details.
 
 ### New features
+
+* Define `immutable_heads()` revset alias in terms of a new `builtin_immutable_heads()`.
+  This enables users to redefine `immutable_heads()` as they wish, but still
+  have `builtin_immutable_heads()` which should not be redefined.
 
 * External diff tools can now be configured to invoke the tool on each file
   individually instead of being passed a directory by setting

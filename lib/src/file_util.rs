@@ -14,11 +14,16 @@
 
 #![allow(missing_docs)]
 
-use std::fs::{self, File};
-use std::path::{Component, Path, PathBuf};
-use std::{io, iter};
+use std::fs;
+use std::fs::File;
+use std::io;
+use std::iter;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 
-use tempfile::{NamedTempFile, PersistError};
+use tempfile::NamedTempFile;
+use tempfile::PersistError;
 use thiserror::Error;
 
 pub use self::platform::*;
@@ -67,6 +72,16 @@ pub fn remove_dir_contents(dirname: &Path) -> Result<(), PathError> {
         fs::remove_file(&path).context(&path)?;
     }
     Ok(())
+}
+
+/// Expands "~/" to "$HOME/".
+pub fn expand_home_path(path_str: &str) -> PathBuf {
+    if let Some(remainder) = path_str.strip_prefix("~/") {
+        if let Ok(home_dir_str) = std::env::var("HOME") {
+            return PathBuf::from(home_dir_str).join(remainder);
+        }
+    }
+    PathBuf::from(path_str)
 }
 
 /// Turns the given `to` path into relative path starting from the `from` path.

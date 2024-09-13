@@ -17,8 +17,11 @@ use jj_lib::merged_tree::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId;
 use tracing::instrument;
 
-use crate::cli_util::{print_unmatched_explicit_paths, CommandHelper, RevisionArg};
-use crate::command_error::{user_error, CommandError};
+use crate::cli_util::print_unmatched_explicit_paths;
+use crate::cli_util::CommandHelper;
+use crate::cli_util::RevisionArg;
+use crate::command_error::user_error;
+use crate::command_error::CommandError;
 use crate::ui::Ui;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
@@ -45,23 +48,6 @@ pub(crate) struct FileChmodArgs {
     /// Paths to change the executable bit for
     #[arg(required = true, value_hint = clap::ValueHint::AnyPath)]
     paths: Vec<String>,
-}
-
-#[instrument(skip_all)]
-pub(crate) fn deprecated_cmd_chmod(
-    ui: &mut Ui,
-    command: &CommandHelper,
-    args: &FileChmodArgs,
-) -> Result<(), CommandError> {
-    writeln!(
-        ui.warning_default(),
-        "`jj chmod` is deprecated; use `jj file chmod` instead, which is equivalent"
-    )?;
-    writeln!(
-        ui.warning_default(),
-        "`jj chmod` will be removed in a future version, and this will be a hard error"
-    )?;
-    cmd_file_chmod(ui, command, args)
 }
 
 #[instrument(skip_all)]

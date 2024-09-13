@@ -17,13 +17,19 @@
 use std::ffi::OsString;
 use std::fmt::Debug;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::ExitStatus;
+use std::process::Stdio;
 
 use either::Either;
 use thiserror::Error;
 
-use crate::signing::{SigStatus, SignError, SigningBackend, Verification};
+use crate::signing::SigStatus;
+use crate::signing::SignError;
+use crate::signing::SigningBackend;
+use crate::signing::Verification;
 
 #[derive(Debug)]
 pub struct SshBackend {
@@ -81,8 +87,8 @@ fn run_command(command: &mut Command, stdin: &[u8]) -> SshResult<Vec<u8>> {
 fn ensure_key_as_file(key: &str) -> SshResult<Either<PathBuf, tempfile::TempPath>> {
     let is_inlined_ssh_key = key.starts_with("ssh-");
     if !is_inlined_ssh_key {
-        let key_path = Path::new(key);
-        return Ok(either::Left(key_path.to_path_buf()));
+        let key_path = crate::file_util::expand_home_path(key);
+        return Ok(either::Left(key_path));
     }
 
     let mut pub_key_file = tempfile::Builder::new()

@@ -14,20 +14,37 @@
 
 #![allow(missing_docs)]
 
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::Write;
 use std::iter::zip;
 
-use futures::{try_join, Stream, StreamExt, TryStreamExt};
+use bstr::BString;
+use futures::stream::BoxStream;
+use futures::try_join;
+use futures::Stream;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use itertools::Itertools;
-use regex::bytes::{Regex, RegexBuilder};
+use regex::bytes::Regex;
+use regex::bytes::RegexBuilder;
 
-use crate::backend::{BackendError, BackendResult, CommitId, FileId, SymlinkId, TreeId, TreeValue};
-use crate::diff::{Diff, DiffHunk};
+use crate::backend::BackendError;
+use crate::backend::BackendResult;
+use crate::backend::CommitId;
+use crate::backend::FileId;
+use crate::backend::SymlinkId;
+use crate::backend::TreeId;
+use crate::backend::TreeValue;
+use crate::copies::CopiesTreeDiffEntry;
+use crate::copies::CopiesTreeDiffEntryPath;
+use crate::diff::Diff;
+use crate::diff::DiffHunk;
 use crate::files;
-use crate::files::{ContentHunk, MergeResult};
-use crate::merge::{Merge, MergeBuilder, MergedTreeValue};
-use crate::merged_tree::TreeDiffStream;
-use crate::repo_path::{RepoPath, RepoPathBuf};
+use crate::files::MergeResult;
+use crate::merge::Merge;
+use crate::merge::MergeBuilder;
+use crate::merge::MergedTreeValue;
+use crate::repo_path::RepoPath;
 use crate::store::Store;
 
 const CONFLICT_START_LINE: &[u8] = b"<<<<<<<";
@@ -81,7 +98,7 @@ async fn get_file_contents(
     store: &Store,
     path: &RepoPath,
     term: &Option<FileId>,
-) -> BackendResult<ContentHunk> {
+) -> BackendResult<BString> {
     match term {
         Some(id) => {
             let mut content = vec![];
@@ -94,11 +111,11 @@ async fn get_file_contents(
                     id: id.clone(),
                     source: err.into(),
                 })?;
-            Ok(ContentHunk(content))
+            Ok(BString::new(content))
         }
         // If the conflict had removed the file on one side, we pretend that the file
         // was empty there.
-        None => Ok(ContentHunk(vec![])),
+        None => Ok(BString::new(vec![])),
     }
 }
 
@@ -106,8 +123,8 @@ pub async fn extract_as_single_hunk(
     merge: &Merge<Option<FileId>>,
     store: &Store,
     path: &RepoPath,
-) -> BackendResult<Merge<ContentHunk>> {
-    let builder: MergeBuilder<ContentHunk> = futures::stream::iter(merge.iter())
+) -> BackendResult<Merge<BString>> {
+    let builder: MergeBuilder<BString> = futures::stream::iter(merge.iter())
         .then(|term| get_file_contents(store, path, term))
         .try_collect()
         .await?;
@@ -128,10 +145,15 @@ pub enum MaterializedTreeValue {
         id: SymlinkId,
         target: String,
     },
-    Conflict {
-        id: MergedTreeValue,
-        contents: Vec<u8>,
+    FileConflict {
+        id: Merge<Option<FileId>>,
+        // TODO: or Vec<(FileId, Box<dyn Read>)> so that caller can stop reading
+        // when null bytes found?
+        contents: Merge<BString>,
         executable: bool,
+    },
+    OtherConflict {
+        id: MergedTreeValue,
     },
     GitSubmodule(CommitId),
     Tree(TreeId),
@@ -187,26 +209,18 @@ async fn materialize_tree_value_no_access_denied(
             panic!("cannot materialize legacy conflict object at path {path:?}");
         }
         Err(conflict) => {
-            let mut contents = vec![];
-            if let Some(file_merge) = conflict.to_file_merge() {
-                let file_merge = file_merge.simplify();
-                let content = extract_as_single_hunk(&file_merge, store, path).await?;
-                materialize_merge_result(&content, &mut contents)
-                    .expect("Failed to materialize conflict to in-memory buffer");
-            } else {
-                // Unless all terms are regular files, we can't do much better than to try to
-                // describe the merge.
-                conflict
-                    .describe(&mut contents)
-                    .expect("Failed to materialize conflict to in-memory buffer");
-            }
+            let Some(file_merge) = conflict.to_file_merge() else {
+                return Ok(MaterializedTreeValue::OtherConflict { id: conflict });
+            };
+            let file_merge = file_merge.simplify();
+            let contents = extract_as_single_hunk(&file_merge, store, path).await?;
             let executable = if let Some(merge) = conflict.to_executable_merge() {
                 merge.resolve_trivial().copied().unwrap_or_default()
             } else {
                 false
             };
-            Ok(MaterializedTreeValue::Conflict {
-                id: conflict,
+            Ok(MaterializedTreeValue::FileConflict {
+                id: file_merge,
                 contents,
                 executable,
             })
@@ -215,13 +229,13 @@ async fn materialize_tree_value_no_access_denied(
 }
 
 pub fn materialize_merge_result(
-    single_hunk: &Merge<ContentHunk>,
+    single_hunk: &Merge<BString>,
     output: &mut dyn Write,
 ) -> std::io::Result<()> {
     let merge_result = files::merge(single_hunk);
     match merge_result {
         MergeResult::Resolved(content) => {
-            output.write_all(&content.0)?;
+            output.write_all(&content)?;
         }
         MergeResult::Conflict(hunks) => {
             let num_conflicts = hunks
@@ -231,7 +245,7 @@ pub fn materialize_merge_result(
             let mut conflict_index = 0;
             for hunk in hunks {
                 if let Some(content) = hunk.as_resolved() {
-                    output.write_all(&content.0)?;
+                    output.write_all(content)?;
                 } else {
                     conflict_index += 1;
                     output.write_all(CONFLICT_START_LINE)?;
@@ -255,15 +269,15 @@ pub fn materialize_merge_result(
                             // terms as snapshots.
                             output.write_all(CONFLICT_MINUS_LINE)?;
                             output.write_all(format!(" Contents of {base_str}\n").as_bytes())?;
-                            output.write_all(&left.0)?;
+                            output.write_all(left)?;
                             continue;
                         };
-                        let diff1 = Diff::by_line([&left.0, &right1.0]).hunks().collect_vec();
+                        let diff1 = Diff::by_line([&left, &right1]).hunks().collect_vec();
                         // Check if the diff against the next positive term is better. Since
                         // we want to preserve the order of the terms, we don't match against
                         // any later positive terms.
                         if let Some(right2) = hunk.get_add(add_index + 1) {
-                            let diff2 = Diff::by_line([&left.0, &right2.0]).hunks().collect_vec();
+                            let diff2 = Diff::by_line([&left, &right2]).hunks().collect_vec();
                             if diff_size(&diff2) < diff_size(&diff1) {
                                 // If the next positive term is a better match, emit
                                 // the current positive term as a snapshot and the next
@@ -272,7 +286,7 @@ pub fn materialize_merge_result(
                                 output.write_all(
                                     format!(" Contents of side #{}\n", add_index + 1).as_bytes(),
                                 )?;
-                                output.write_all(&right1.0)?;
+                                output.write_all(right1)?;
                                 output.write_all(CONFLICT_DIFF_LINE)?;
                                 output.write_all(
                                     format!(
@@ -302,7 +316,7 @@ pub fn materialize_merge_result(
                         output.write_all(
                             format!(" Contents of side #{}\n", add_index + 1).as_bytes(),
                         )?;
-                        output.write_all(&slice.0)?;
+                        output.write_all(slice)?;
                     }
                     output.write_all(CONFLICT_END_LINE)?;
                     output.write_all(
@@ -325,24 +339,27 @@ fn diff_size(hunks: &[DiffHunk]) -> usize {
         .sum()
 }
 
+pub struct MaterializedTreeDiffEntry {
+    pub path: CopiesTreeDiffEntryPath,
+    pub values: BackendResult<(MaterializedTreeValue, MaterializedTreeValue)>,
+}
+
 pub fn materialized_diff_stream<'a>(
     store: &'a Store,
-    tree_diff: TreeDiffStream<'a>,
-) -> impl Stream<
-    Item = (
-        RepoPathBuf,
-        BackendResult<(MaterializedTreeValue, MaterializedTreeValue)>,
-    ),
-> + 'a {
+    tree_diff: BoxStream<'a, CopiesTreeDiffEntry>,
+) -> impl Stream<Item = MaterializedTreeDiffEntry> + 'a {
     tree_diff
-        .map(|(path, diff)| async {
-            match diff {
-                Err(err) => (path, Err(err)),
+        .map(|CopiesTreeDiffEntry { path, values }| async {
+            match values {
+                Err(err) => MaterializedTreeDiffEntry {
+                    path,
+                    values: Err(err),
+                },
                 Ok((before, after)) => {
-                    let before_future = materialize_tree_value(store, &path, before);
-                    let after_future = materialize_tree_value(store, &path, after);
+                    let before_future = materialize_tree_value(store, path.source(), before);
+                    let after_future = materialize_tree_value(store, path.target(), after);
                     let values = try_join!(before_future, after_future);
-                    (path, values)
+                    MaterializedTreeDiffEntry { path, values }
                 }
             }
         })
@@ -355,7 +372,7 @@ pub fn materialized_diff_stream<'a>(
 /// invalid if they don't have the expected arity.
 // TODO: "parse" is not usually the opposite of "materialize", so maybe we
 // should rename them to "serialize" and "deserialize"?
-pub fn parse_conflict(input: &[u8], num_sides: usize) -> Option<Vec<Merge<ContentHunk>>> {
+pub fn parse_conflict(input: &[u8], num_sides: usize) -> Option<Vec<Merge<BString>>> {
     if input.is_empty() {
         return None;
     }
@@ -375,7 +392,7 @@ pub fn parse_conflict(input: &[u8], num_sides: usize) -> Option<Vec<Merge<Conten
                 if hunk.num_sides() == num_sides {
                     let resolved_slice = &input[resolved_start..conflict_start.unwrap()];
                     if !resolved_slice.is_empty() {
-                        hunks.push(Merge::resolved(ContentHunk(resolved_slice.to_vec())));
+                        hunks.push(Merge::resolved(BString::from(resolved_slice)));
                     }
                     hunks.push(hunk);
                     resolved_start = pos + line.len();
@@ -390,15 +407,13 @@ pub fn parse_conflict(input: &[u8], num_sides: usize) -> Option<Vec<Merge<Conten
         None
     } else {
         if resolved_start < input.len() {
-            hunks.push(Merge::resolved(ContentHunk(
-                input[resolved_start..].to_vec(),
-            )));
+            hunks.push(Merge::resolved(BString::from(&input[resolved_start..])));
         }
         Some(hunks)
     }
 }
 
-fn parse_conflict_hunk(input: &[u8]) -> Merge<ContentHunk> {
+fn parse_conflict_hunk(input: &[u8]) -> Merge<BString> {
     enum State {
         Diff,
         Minus,
@@ -413,18 +428,18 @@ fn parse_conflict_hunk(input: &[u8]) -> Merge<ContentHunk> {
             match line[0] {
                 CONFLICT_DIFF_LINE_CHAR => {
                     state = State::Diff;
-                    removes.push(ContentHunk(vec![]));
-                    adds.push(ContentHunk(vec![]));
+                    removes.push(BString::new(vec![]));
+                    adds.push(BString::new(vec![]));
                     continue;
                 }
                 CONFLICT_MINUS_LINE_CHAR => {
                     state = State::Minus;
-                    removes.push(ContentHunk(vec![]));
+                    removes.push(BString::new(vec![]));
                     continue;
                 }
                 CONFLICT_PLUS_LINE_CHAR => {
                     state = State::Plus;
-                    adds.push(ContentHunk(vec![]));
+                    adds.push(BString::new(vec![]));
                     continue;
                 }
                 _ => {}
@@ -433,26 +448,26 @@ fn parse_conflict_hunk(input: &[u8]) -> Merge<ContentHunk> {
         match state {
             State::Diff => {
                 if let Some(rest) = line.strip_prefix(b"-") {
-                    removes.last_mut().unwrap().0.extend_from_slice(rest);
+                    removes.last_mut().unwrap().extend_from_slice(rest);
                 } else if let Some(rest) = line.strip_prefix(b"+") {
-                    adds.last_mut().unwrap().0.extend_from_slice(rest);
+                    adds.last_mut().unwrap().extend_from_slice(rest);
                 } else if let Some(rest) = line.strip_prefix(b" ") {
-                    removes.last_mut().unwrap().0.extend_from_slice(rest);
-                    adds.last_mut().unwrap().0.extend_from_slice(rest);
+                    removes.last_mut().unwrap().extend_from_slice(rest);
+                    adds.last_mut().unwrap().extend_from_slice(rest);
                 } else {
                     // Doesn't look like a conflict
-                    return Merge::resolved(ContentHunk(vec![]));
+                    return Merge::resolved(BString::new(vec![]));
                 }
             }
             State::Minus => {
-                removes.last_mut().unwrap().0.extend_from_slice(line);
+                removes.last_mut().unwrap().extend_from_slice(line);
             }
             State::Plus => {
-                adds.last_mut().unwrap().0.extend_from_slice(line);
+                adds.last_mut().unwrap().extend_from_slice(line);
             }
             State::Unknown => {
                 // Doesn't look like a conflict
-                return Merge::resolved(ContentHunk(vec![]));
+                return Merge::resolved(BString::new(vec![]));
             }
         }
     }
@@ -506,11 +521,11 @@ pub async fn update_from_content(
     for hunk in hunks {
         if let Some(slice) = hunk.as_resolved() {
             for content in contents.iter_mut() {
-                content.extend_from_slice(&slice.0);
+                content.extend_from_slice(slice);
             }
         } else {
             for (content, slice) in zip(contents.iter_mut(), hunk.into_iter()) {
-                content.extend(slice.0);
+                content.extend(Vec::from(slice));
             }
         }
     }
