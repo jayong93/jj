@@ -34,7 +34,7 @@
             pkgs.lib.all (re: builtins.match re relPath == null) regexes;
         };
 
-      ourRustVersion = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.complete);
+      ourRustVersion = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default);
 
       ourRustPlatform = pkgs.makeRustPlatform {
         rustc = ourRustVersion;
@@ -60,7 +60,14 @@
         if pkgs.stdenv.isLinux then
           [ "-fuse-ld=mold" "-Wl,--compress-debug-sections=zstd" ]
         else if pkgs.stdenv.isDarwin then
-          [ "-fuse-ld=/usr/bin/ld" "-ld_new" ]
+          # on darwin, /usr/bin/ld actually looks at the environment variable
+          # $DEVELOPER_DIR, which is set by the nix stdenv, and if set,
+          # automatically uses it to route the `ld` invocation to the binary
+          # within. in the devShell though, that isn't what we want; it's
+          # functional, but Xcode's linker as of ~v15 (not yet open source)
+          # is ultra-fast and very shiny; it is enabled via -ld_new, and on by
+          # default as of v16+
+          [ "--ld-path=$(unset DEVELOPER_DIR; /usr/bin/xcrun --find ld)" "-ld_new" ]
         else
           [ ];
 
@@ -120,13 +127,15 @@
               --fish <($out/bin/jj util completion fish) \
               --zsh <($out/bin/jj util completion zsh)
           '';
+
+          meta = {
+            description = "Git-compatible DVCS that is both simple and powerful";
+            homepage = "https://github.com/martinvonz/jj";
+            license = pkgs.lib.licenses.asl20;
+            mainProgram = "jj";
+          };
         };
         default = self.packages.${system}.jujutsu;
-      };
-
-      apps.default = {
-        type = "app";
-        program = "${self.packages.${system}.jujutsu}/bin/jj";
       };
 
       formatter = pkgs.nixpkgs-fmt;
@@ -148,8 +157,17 @@
       });
 
       devShells.default = pkgs.mkShell {
-        buildInputs = with pkgs; [
-          ourRustVersion
+        packages = with pkgs; [
+          # NOTE (aseipp): explicitly add rust-src to the rustc compiler only in
+          # devShell. this in turn causes a dependency on the rust compiler src,
+          # which bloats the closure size by several GiB. but doing this here
+          # and not by default avoids the default flake install from including
+          # that dependency, so it's worth it
+          #
+          # relevant PR: https://github.com/rust-lang/rust/pull/129687
+          (ourRustVersion.override {
+            extensions = [ "rust-src" "rust-analyzer" ];
+          })
 
           # Foreign dependencies
           openssl zstd libgit2
@@ -172,7 +190,7 @@
           openssh
 
           # For building the documentation website
-          poetry
+          uv
         ] ++ darwinDeps ++ linuxNativeDeps;
 
         shellHook = ''

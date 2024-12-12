@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 
+use indoc::indoc;
 use insta::assert_snapshot;
 use itertools::Itertools;
 use regex::Regex;
@@ -183,7 +184,7 @@ fn test_config_list_layer() {
     let mut test_env = TestEnvironment::default();
     test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
     let user_config_path = test_env.config_path().join("config.toml");
-    test_env.set_config_path(user_config_path.to_owned());
+    test_env.set_config_path(user_config_path.clone());
     let repo_path = test_env.env_root().join("repo");
 
     // User
@@ -456,7 +457,7 @@ fn test_config_set_for_user() {
     test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
     // Point to a config file since `config set` can't handle directories.
     let user_config_path = test_env.config_path().join("config.toml");
-    test_env.set_config_path(user_config_path.to_owned());
+    test_env.set_config_path(user_config_path.clone());
     let repo_path = test_env.env_root().join("repo");
 
     test_env.jj_cmd_ok(
@@ -603,6 +604,129 @@ fn test_config_set_nontable_parent() {
 }
 
 #[test]
+fn test_config_unset_non_existent_key() {
+    let mut test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
+    // Point to a config file since `config set` can't handle directories.
+    let user_config_path = test_env.config_path().join("config.toml");
+    test_env.set_config_path(user_config_path);
+    let repo_path = test_env.env_root().join("repo");
+
+    let stderr = test_env.jj_cmd_failure(&repo_path, &["config", "unset", "--user", "nonexistent"]);
+    insta::assert_snapshot!(stderr, @r###"
+    Config error: configuration property "nonexistent" not found
+    For help, see https://martinvonz.github.io/jj/latest/config/.
+    "###);
+}
+
+#[test]
+fn test_config_unset_inline_table_key() {
+    let mut test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
+    // Point to a config file since `config set` can't handle directories.
+    let user_config_path = test_env.config_path().join("config.toml");
+    test_env.set_config_path(user_config_path.clone());
+    let repo_path = test_env.env_root().join("repo");
+
+    test_env.jj_cmd_ok(
+        &repo_path,
+        &["config", "set", "--user", "inline-table", "{ foo = true }"],
+    );
+    let stderr = test_env.jj_cmd_failure(
+        &repo_path,
+        &["config", "unset", "--user", "inline-table.foo"],
+    );
+
+    insta::assert_snapshot!(stderr, @r###"
+    Config error: "inline-table" is not a table
+    For help, see https://martinvonz.github.io/jj/latest/config/.
+    "###);
+}
+
+#[test]
+fn test_config_unset_table_like() {
+    let mut test_env = TestEnvironment::default();
+    // Point to a config file since `config unset` can't handle directories.
+    let user_config_path = test_env.config_path().join("config.toml");
+    test_env.set_config_path(user_config_path.clone());
+
+    std::fs::write(
+        &user_config_path,
+        indoc! {b"
+            inline-table = { foo = true }
+            [non-inline-table]
+            foo = true
+        "},
+    )
+    .unwrap();
+
+    // Inline table is a "value", so it can be deleted.
+    test_env.jj_cmd_success(
+        test_env.env_root(),
+        &["config", "unset", "--user", "inline-table"],
+    );
+    // Non-inline table cannot be deleted.
+    let stderr = test_env.jj_cmd_failure(
+        test_env.env_root(),
+        &["config", "unset", "--user", "non-inline-table"],
+    );
+    insta::assert_snapshot!(stderr, @"Error: Won't remove table non-inline-table");
+
+    let user_config_toml = std::fs::read_to_string(&user_config_path).unwrap();
+    insta::assert_snapshot!(user_config_toml, @r"
+    [non-inline-table]
+    foo = true
+    ");
+}
+
+#[test]
+fn test_config_unset_for_user() {
+    let mut test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
+    // Point to a config file since `config set` can't handle directories.
+    let user_config_path = test_env.config_path().join("config.toml");
+    test_env.set_config_path(user_config_path.clone());
+    let repo_path = test_env.env_root().join("repo");
+
+    test_env.jj_cmd_ok(&repo_path, &["config", "set", "--user", "foo", "true"]);
+    test_env.jj_cmd_ok(&repo_path, &["config", "unset", "--user", "foo"]);
+
+    test_env.jj_cmd_ok(
+        &repo_path,
+        &["config", "set", "--user", "table.foo", "true"],
+    );
+    test_env.jj_cmd_ok(&repo_path, &["config", "unset", "--user", "table.foo"]);
+
+    test_env.jj_cmd_ok(
+        &repo_path,
+        &["config", "set", "--user", "table.inline", "{ foo = true }"],
+    );
+    test_env.jj_cmd_ok(&repo_path, &["config", "unset", "--user", "table.inline"]);
+
+    let user_config_toml = std::fs::read_to_string(&user_config_path).unwrap();
+    insta::assert_snapshot!(user_config_toml, @r#"
+        [table]
+        "#);
+}
+
+#[test]
+fn test_config_unset_for_repo() {
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
+    let repo_path = test_env.env_root().join("repo");
+
+    test_env.jj_cmd_ok(
+        &repo_path,
+        &["config", "set", "--repo", "test-key", "test-val"],
+    );
+    test_env.jj_cmd_ok(&repo_path, &["config", "unset", "--repo", "test-key"]);
+
+    let repo_config_path = repo_path.join(".jj/repo/config.toml");
+    let repo_config_toml = std::fs::read_to_string(repo_config_path).unwrap();
+    insta::assert_snapshot!(repo_config_toml, @"");
+}
+
+#[test]
 fn test_config_edit_missing_opt() {
     let test_env = TestEnvironment::default();
     let stderr = test_env.jj_cmd_cli_error(test_env.env_root(), &["config", "edit"]);
@@ -673,9 +797,7 @@ fn test_config_path() {
 fn test_config_edit_repo_outside_repo() {
     let test_env = TestEnvironment::default();
     let stderr = test_env.jj_cmd_failure(test_env.env_root(), &["config", "edit", "--repo"]);
-    insta::assert_snapshot!(stderr, @r###"
-    Error: There is no jj repo in "."
-    "###);
+    insta::assert_snapshot!(stderr, @"Error: No repo config path found to edit");
 }
 
 #[test]
@@ -714,10 +836,10 @@ fn test_config_get() {
     "###);
 
     let stdout = test_env.jj_cmd_failure(test_env.env_root(), &["config", "get", "table.list"]);
-    insta::assert_snapshot!(stdout, @r###"
-    Config error: invalid type: sequence, expected a value convertible to a string
+    insta::assert_snapshot!(stdout.replace('\\', "/"), @r"
+    Config error: invalid type: sequence, expected a value convertible to a string in config/config0002.toml
     For help, see https://martinvonz.github.io/jj/latest/config/.
-    "###);
+    ");
 
     let stdout = test_env.jj_cmd_failure(test_env.env_root(), &["config", "get", "table"]);
     insta::assert_snapshot!(stdout, @r###"
@@ -840,7 +962,7 @@ fn test_config_show_paths() {
     let mut test_env = TestEnvironment::default();
     test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
     let user_config_path = test_env.config_path().join("config.toml");
-    test_env.set_config_path(user_config_path.to_owned());
+    test_env.set_config_path(user_config_path.clone());
     let repo_path = test_env.env_root().join("repo");
 
     test_env.jj_cmd_ok(

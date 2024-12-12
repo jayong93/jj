@@ -12,11 +12,12 @@ use jj_lib::backend::BackendResult;
 use jj_lib::backend::FileId;
 use jj_lib::backend::MergedTreeId;
 use jj_lib::backend::TreeValue;
-use jj_lib::conflicts::materialize_merge_result;
+use jj_lib::conflicts::materialize_merge_result_to_bytes;
 use jj_lib::conflicts::materialize_tree_value;
+use jj_lib::conflicts::ConflictMarkerStyle;
 use jj_lib::conflicts::MaterializedTreeValue;
 use jj_lib::diff::Diff;
-use jj_lib::diff::DiffHunk;
+use jj_lib::diff::DiffHunkKind;
 use jj_lib::files;
 use jj_lib::files::MergeResult;
 use jj_lib::matchers::Matcher;
@@ -37,7 +38,7 @@ pub enum BuiltinToolError {
     Record(#[from] scm_record::RecordError),
     #[error(transparent)]
     ReadFileBackend(BackendError),
-    #[error("Failed to read file {path:?} with ID {id}", id = id.hex())]
+    #[error("Failed to read file {path:?} with ID {id}")]
     ReadFileIo {
         path: RepoPathBuf,
         id: FileId,
@@ -141,6 +142,7 @@ fn read_file_contents(
     store: &Store,
     tree: &MergedTree,
     path: &RepoPath,
+    conflict_marker_style: ConflictMarkerStyle,
 ) -> Result<FileInfo, BuiltinToolError> {
     let value = tree.path_value(path)?;
     let materialized_value = materialize_tree_value(store, path, value)
@@ -211,9 +213,7 @@ fn read_file_contents(
             contents,
             executable: _,
         } => {
-            let mut buf = Vec::new();
-            materialize_merge_result(&contents, &mut buf)
-                .expect("Failed to materialize conflict to in-memory buffer");
+            let buf = materialize_merge_result_to_bytes(&contents, conflict_marker_style).into();
             // TODO: Render the ID somehow?
             let contents = buf_to_file_contents(None, buf);
             Ok(FileInfo {
@@ -253,8 +253,10 @@ fn make_diff_sections(
     let diff = Diff::by_line([left_contents.as_bytes(), right_contents.as_bytes()]);
     let mut sections = Vec::new();
     for hunk in diff.hunks() {
-        match hunk {
-            DiffHunk::Matching(text) => {
+        match hunk.kind {
+            DiffHunkKind::Matching => {
+                debug_assert!(hunk.contents.iter().all_equal());
+                let text = hunk.contents[0];
                 let text =
                     std::str::from_utf8(text).map_err(|err| BuiltinToolError::DecodeUtf8 {
                         source: err,
@@ -265,9 +267,10 @@ fn make_diff_sections(
                         .split_inclusive('\n')
                         .map(|line| Cow::Owned(line.to_owned()))
                         .collect(),
-                })
+                });
             }
-            DiffHunk::Different(sides) => {
+            DiffHunkKind::Different => {
+                let sides = &hunk.contents;
                 assert_eq!(sides.len(), 2, "only two inputs were provided to the diff");
                 let left_side =
                     std::str::from_utf8(sides[0]).map_err(|err| BuiltinToolError::DecodeUtf8 {
@@ -285,7 +288,7 @@ fn make_diff_sections(
                         make_section_changed_lines(right_side, scm_record::ChangeType::Added),
                     ]
                     .concat(),
-                })
+                });
             }
         }
     }
@@ -308,11 +311,13 @@ pub fn make_diff_files(
     left_tree: &MergedTree,
     right_tree: &MergedTree,
     changed_files: &[RepoPathBuf],
+    conflict_marker_style: ConflictMarkerStyle,
 ) -> Result<Vec<scm_record::File<'static>>, BuiltinToolError> {
     let mut files = Vec::new();
     for changed_path in changed_files {
-        let left_info = read_file_contents(store, left_tree, changed_path)?;
-        let right_info = read_file_contents(store, right_tree, changed_path)?;
+        let left_info = read_file_contents(store, left_tree, changed_path, conflict_marker_style)?;
+        let right_info =
+            read_file_contents(store, right_tree, changed_path, conflict_marker_style)?;
         let mut sections = Vec::new();
 
         if should_render_mode_section(&left_info, &right_info) {
@@ -361,7 +366,7 @@ pub fn make_diff_files(
                     is_checked: false,
                     old_description: None,
                     new_description: Some(Cow::Owned(describe_binary(hash.as_deref(), num_bytes))),
-                })
+                });
             }
 
             (
@@ -426,13 +431,14 @@ pub fn make_diff_files(
                     is_checked: false,
                     old_description: Some(Cow::Owned(describe_binary(hash.as_deref(), num_bytes))),
                     new_description: None,
-                })
+                });
             }
         }
 
         files.push(scm_record::File {
             old_path: None,
-            path: Cow::Owned(changed_path.to_fs_path(Path::new(""))),
+            // Path for displaying purposes, not for file access.
+            path: Cow::Owned(changed_path.to_fs_path_unchecked(Path::new(""))),
             file_mode: Some(left_info.file_mode),
             sections,
         });
@@ -507,7 +513,7 @@ pub fn apply_diff_builtin(
                         executable: file.get_file_mode()
                             == Some(scm_record::FileMode(mode::EXECUTABLE)),
                     }),
-                )
+                );
             }
         }
     }
@@ -520,6 +526,7 @@ pub fn edit_diff_builtin(
     left_tree: &MergedTree,
     right_tree: &MergedTree,
     matcher: &dyn Matcher,
+    conflict_marker_style: ConflictMarkerStyle,
 ) -> Result<MergedTreeId, BuiltinToolError> {
     let store = left_tree.store().clone();
     // TODO: handle copy tracking
@@ -528,7 +535,13 @@ pub fn edit_diff_builtin(
         .map(|TreeDiffEntry { path, values }| values.map(|_| path))
         .try_collect()
         .block_on()?;
-    let files = make_diff_files(&store, left_tree, right_tree, &changed_files)?;
+    let files = make_diff_files(
+        &store,
+        left_tree,
+        right_tree,
+        &changed_files,
+        conflict_marker_style,
+    )?;
     let mut input = scm_record::helpers::CrosstermInput;
     let recorder = scm_record::Recorder::new(
         scm_record::RecordState {
@@ -637,7 +650,8 @@ pub fn edit_merge_builtin(
             is_read_only: false,
             files: vec![scm_record::File {
                 old_path: None,
-                path: Cow::Owned(path.to_fs_path(Path::new(""))),
+                // Path for displaying purposes, not for file access.
+                path: Cow::Owned(path.to_fs_path_unchecked(Path::new(""))),
                 file_mode: None,
                 sections,
             }],
@@ -693,7 +707,14 @@ mod tests {
             changed_path.to_owned(),
             added_path.to_owned(),
         ];
-        let files = make_diff_files(store, &left_tree, &right_tree, &changed_files).unwrap();
+        let files = make_diff_files(
+            store,
+            &left_tree,
+            &right_tree,
+            &changed_files,
+            ConflictMarkerStyle::Diff,
+        )
+        .unwrap();
         insta::assert_debug_snapshot!(files, @r###"
         [
             File {
@@ -800,7 +821,7 @@ mod tests {
         );
 
         let mut files = files;
-        for file in files.iter_mut() {
+        for file in &mut files {
             file.toggle_all();
         }
         let all_changes_tree_id =
@@ -823,7 +844,14 @@ mod tests {
         let right_tree = testutils::create_tree(&test_repo.repo, &[(added_empty_file_path, "")]);
 
         let changed_files = vec![added_empty_file_path.to_owned()];
-        let files = make_diff_files(store, &left_tree, &right_tree, &changed_files).unwrap();
+        let files = make_diff_files(
+            store,
+            &left_tree,
+            &right_tree,
+            &changed_files,
+            ConflictMarkerStyle::Diff,
+        )
+        .unwrap();
         insta::assert_debug_snapshot!(files, @r###"
         [
             File {
@@ -864,7 +892,7 @@ mod tests {
         );
 
         let mut files = files;
-        for file in files.iter_mut() {
+        for file in &mut files {
             file.toggle_all();
         }
         let all_changes_tree_id =
@@ -887,7 +915,14 @@ mod tests {
         let right_tree = testutils::create_tree(&test_repo.repo, &[]);
 
         let changed_files = vec![added_empty_file_path.to_owned()];
-        let files = make_diff_files(store, &left_tree, &right_tree, &changed_files).unwrap();
+        let files = make_diff_files(
+            store,
+            &left_tree,
+            &right_tree,
+            &changed_files,
+            ConflictMarkerStyle::Diff,
+        )
+        .unwrap();
         insta::assert_debug_snapshot!(files, @r###"
         [
             File {
@@ -928,7 +963,7 @@ mod tests {
         );
 
         let mut files = files;
-        for file in files.iter_mut() {
+        for file in &mut files {
             file.toggle_all();
         }
         let all_changes_tree_id =
@@ -952,7 +987,14 @@ mod tests {
             testutils::create_tree(&test_repo.repo, &[(empty_file_path, "modified\n")]);
 
         let changed_files = vec![empty_file_path.to_owned()];
-        let files = make_diff_files(store, &left_tree, &right_tree, &changed_files).unwrap();
+        let files = make_diff_files(
+            store,
+            &left_tree,
+            &right_tree,
+            &changed_files,
+            ConflictMarkerStyle::Diff,
+        )
+        .unwrap();
         insta::assert_debug_snapshot!(files, @r###"
         [
             File {
@@ -993,7 +1035,7 @@ mod tests {
         );
 
         let mut files = files;
-        for file in files.iter_mut() {
+        for file in &mut files {
             file.toggle_all();
         }
         let all_changes_tree_id =

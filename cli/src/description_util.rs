@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::path::Path;
 
 use bstr::ByteVec as _;
 use indexmap::IndexMap;
@@ -12,7 +13,6 @@ use thiserror::Error;
 
 use crate::cli_util::edit_temp_file;
 use crate::cli_util::short_commit_hash;
-use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::WorkspaceCommandTransaction;
 use crate::command_error::CommandError;
 use crate::formatter::PlainTextFormatter;
@@ -28,27 +28,26 @@ where
 {
     let description = lines
         .into_iter()
-        .filter(|line| !line.as_ref().starts_with("JJ: "))
+        .filter(|line| !line.as_ref().starts_with("JJ:"))
         .fold(String::new(), |acc, line| acc + line.as_ref() + "\n");
     text_util::complete_newline(description.trim_matches('\n'))
 }
 
 pub fn edit_description(
-    workspace_command: &WorkspaceCommandHelper,
+    repo_path: &Path,
     description: &str,
     settings: &UserSettings,
 ) -> Result<String, CommandError> {
     let description = format!(
-        r#"{}
-JJ: Lines starting with "JJ: " (like this one) will be removed.
-"#,
-        description
+        r#"{description}
+JJ: Lines starting with "JJ:" (like this one) will be removed.
+"#
     );
 
     let description = edit_temp_file(
         "description",
         ".jjdescription",
-        workspace_command.repo_path(),
+        repo_path,
         &description,
         settings,
     )?;
@@ -73,7 +72,7 @@ pub fn edit_multiple_descriptions(
         JJ: - The syntax of the separator lines may change in the future.
 
     "#});
-    for (commit_id, temp_commit) in commits.iter() {
+    for (commit_id, temp_commit) in commits {
         let commit_hash = short_commit_hash(commit_id);
         bulk_message.push_str("JJ: describe ");
         bulk_message.push_str(&commit_hash);
@@ -139,7 +138,7 @@ where
             lines.push(line);
         }
         // Do not allow lines without a commit header, except for empty lines or comments.
-        else if !line.trim().is_empty() && !line.starts_with("JJ: ") {
+        else if !line.trim().is_empty() && !line.starts_with("JJ:") {
             return Err(ParseBulkEditMessageError::LineWithoutCommitHeader(
                 line.to_owned(),
             ));
@@ -179,7 +178,7 @@ where
 /// then that one is used. Otherwise we concatenate the messages and ask the
 /// user to edit the result in their editor.
 pub fn combine_messages(
-    workspace_command: &WorkspaceCommandHelper,
+    repo_path: &Path,
     sources: &[&Commit],
     destination: &Commit,
     settings: &UserSettings,
@@ -209,7 +208,7 @@ pub fn combine_messages(
         combined.push_str("\nJJ: Description from source commit:\n");
         combined.push_str(commit.description());
     }
-    edit_description(workspace_command, &combined, settings)
+    edit_description(repo_path, &combined, settings)
 }
 
 /// Create a description from a list of paragraphs.
@@ -238,9 +237,9 @@ pub fn description_template(
     // commit to be backed out, and the generated description could be set
     // without spawning editor.
 
-    // Named as "draft" because the output can contain "JJ: " comment lines.
+    // Named as "draft" because the output can contain "JJ:" comment lines.
     let template_key = "templates.draft_commit_description";
-    let template_text = tx.settings().config().get_string(template_key)?;
+    let template_text = tx.settings().get_string(template_key)?;
     let template = tx.parse_commit_template(ui, &template_text)?;
 
     let mut output = Vec::new();

@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 
+use clap_complete::ArgValueCandidates;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use jj_lib::backend::ChangeId;
@@ -40,6 +42,7 @@ use crate::cli_util::CommandHelper;
 use crate::cli_util::LogContentFormat;
 use crate::command_error::CommandError;
 use crate::commit_templater::CommitTemplateLanguage;
+use crate::complete;
 use crate::diff_util::diff_formats_for_log;
 use crate::diff_util::DiffFormatArgs;
 use crate::diff_util::DiffRenderer;
@@ -54,13 +57,25 @@ use crate::ui::Ui;
 #[derive(clap::Args, Clone, Debug)]
 pub struct OperationDiffArgs {
     /// Show repository changes in this operation, compared to its parent
-    #[arg(long, visible_alias = "op")]
+    #[arg(
+        long,
+        visible_alias = "op",
+        add = ArgValueCandidates::new(complete::operations),
+    )]
     operation: Option<String>,
     /// Show repository changes from this operation
-    #[arg(long, conflicts_with = "operation")]
+    #[arg(
+        long, short,
+        conflicts_with = "operation",
+        add = ArgValueCandidates::new(complete::operations),
+    )]
     from: Option<String>,
     /// Show repository changes to this operation
-    #[arg(long, conflicts_with = "operation")]
+    #[arg(
+        long, short,
+        conflicts_with = "operation",
+        add = ArgValueCandidates::new(complete::operations),
+    )]
     to: Option<String>,
     /// Don't show the graph, show a flat list of modified changes
     #[arg(long)]
@@ -110,29 +125,26 @@ pub fn cmd_op_diff(
     let diff_renderer = {
         let formats = diff_formats_for_log(command.settings(), &args.diff_format, args.patch)?;
         let path_converter = workspace_env.path_converter();
-        (!formats.is_empty()).then(|| DiffRenderer::new(merged_repo, path_converter, formats))
+        let conflict_marker_style = workspace_env.conflict_marker_style();
+        (!formats.is_empty())
+            .then(|| DiffRenderer::new(merged_repo, path_converter, conflict_marker_style, formats))
     };
     let id_prefix_context = workspace_env.new_id_prefix_context();
     let commit_summary_template = {
         let language = workspace_env.commit_template_language(merged_repo, &id_prefix_context);
-        let text = command
-            .settings()
-            .config()
-            .get_string("templates.commit_summary")?;
+        let text = command.settings().get_string("templates.commit_summary")?;
         workspace_env.parse_template(ui, &language, &text, CommitTemplateLanguage::wrap_commit)?
     };
 
     let op_summary_template = workspace_command.operation_summary_template();
     ui.request_pager();
     let mut formatter = ui.stdout_formatter();
-    formatter.with_label("op_log", |formatter| {
-        write!(formatter, "From operation ")?;
-        op_summary_template.format(&from_op, &mut *formatter)?;
-        writeln!(formatter)?;
-        write!(formatter, "  To operation ")?;
-        op_summary_template.format(&to_op, &mut *formatter)?;
-        writeln!(formatter)
-    })?;
+    write!(formatter, "From operation: ")?;
+    op_summary_template.format(&from_op, &mut *formatter)?;
+    writeln!(formatter)?;
+    write!(formatter, "  To operation: ")?;
+    op_summary_template.format(&to_op, &mut *formatter)?;
+    writeln!(formatter)?;
 
     show_op_diff(
         ui,
@@ -197,21 +209,24 @@ pub fn show_op_diff(
             writeln!(formatter, "Changed commits:")
         })?;
         if let Some(graph_style) = graph_style {
-            let mut graph = get_graphlog(graph_style, formatter.raw());
+            let mut raw_output = formatter.raw()?;
+            let mut graph = get_graphlog(graph_style, raw_output.as_mut());
 
-            let graph_iter =
-                TopoGroupedGraphIterator::new(ordered_change_ids.iter().map(|change_id| {
+            let graph_iter = TopoGroupedGraphIterator::new(ordered_change_ids.iter().map(
+                |change_id| -> Result<_, Infallible> {
                     let parent_change_ids = change_parents.get(change_id).unwrap();
-                    (
+                    Ok((
                         change_id.clone(),
                         parent_change_ids
                             .iter()
                             .map(|parent_change_id| GraphEdge::direct(parent_change_id.clone()))
                             .collect_vec(),
-                    )
-                }));
+                    ))
+                },
+            ));
 
-            for (change_id, edges) in graph_iter {
+            for node in graph_iter {
+                let (change_id, edges) = node.unwrap();
                 let modified_change = changes.get(&change_id).unwrap();
                 let edges = edges
                     .iter()
@@ -282,7 +297,7 @@ pub fn show_op_diff(
         })?;
         for (name, (from_target, to_target)) in changed_local_bookmarks {
             with_content_format.write(formatter, |formatter| {
-                writeln!(formatter, "{}:", name)?;
+                writeln!(formatter, "{name}:")?;
                 write_ref_target_summary(
                     formatter,
                     current_repo,
@@ -310,7 +325,7 @@ pub fn show_op_diff(
         with_content_format.write(formatter, |formatter| writeln!(formatter, "Changed tags:"))?;
         for (name, (from_target, to_target)) in changed_tags {
             with_content_format.write(formatter, |formatter| {
-                writeln!(formatter, "{}:", name)?;
+                writeln!(formatter, "{name}:")?;
                 write_ref_target_summary(
                     formatter,
                     current_repo,
@@ -351,7 +366,7 @@ pub fn show_op_diff(
         };
         for ((name, remote_name), (from_ref, to_ref)) in changed_remote_bookmarks {
             with_content_format.write(formatter, |formatter| {
-                writeln!(formatter, "{}@{}:", name, remote_name)?;
+                writeln!(formatter, "{name}@{remote_name}:")?;
                 write_ref_target_summary(
                     formatter,
                     current_repo,
@@ -383,13 +398,13 @@ fn write_modified_change_summary(
     modified_change: &ModifiedChange,
 ) -> Result<(), std::io::Error> {
     writeln!(formatter, "Change {}", short_change_hash(change_id))?;
-    for commit in modified_change.added_commits.iter() {
+    for commit in &modified_change.added_commits {
         formatter.with_label("diff", |formatter| write!(formatter.labeled("added"), "+"))?;
         write!(formatter, " ")?;
         commit_summary_template.format(commit, formatter)?;
         writeln!(formatter)?;
     }
-    for commit in modified_change.removed_commits.iter() {
+    for commit in &modified_change.removed_commits {
         formatter.with_label("diff", |formatter| {
             write!(formatter.labeled("removed"), "-")
         })?;
@@ -422,7 +437,7 @@ fn write_ref_target_summary(
         })?;
         write!(formatter, " ")?;
         if let Some(prefix) = prefix {
-            write!(formatter, "{} ", prefix)?;
+            write!(formatter, "{prefix} ")?;
         }
         Ok(())
     };

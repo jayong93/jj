@@ -14,20 +14,22 @@
 
 //! Utility for parsing and evaluating user-provided revset expressions.
 
+use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use itertools::Itertools as _;
-use jj_lib::backend::BackendResult;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
+use jj_lib::config::ConfigSource;
+use jj_lib::config::StackedConfig;
 use jj_lib::id_prefix::IdPrefixContext;
 use jj_lib::repo::Repo;
 use jj_lib::revset;
 use jj_lib::revset::DefaultSymbolResolver;
+use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::Revset;
 use jj_lib::revset::RevsetAliasesMap;
-use jj_lib::revset::RevsetCommitRef;
 use jj_lib::revset::RevsetDiagnostics;
 use jj_lib::revset::RevsetEvaluationError;
 use jj_lib::revset::RevsetExpression;
@@ -37,13 +39,12 @@ use jj_lib::revset::RevsetParseContext;
 use jj_lib::revset::RevsetParseError;
 use jj_lib::revset::RevsetResolutionError;
 use jj_lib::revset::SymbolResolverExtension;
+use jj_lib::revset::UserRevsetExpression;
 use jj_lib::settings::ConfigResultExt as _;
 use thiserror::Error;
 
 use crate::command_error::user_error;
 use crate::command_error::CommandError;
-use crate::config::ConfigSource;
-use crate::config::LayeredConfigs;
 use crate::formatter::Formatter;
 use crate::templater::TemplateRenderer;
 use crate::ui::Ui;
@@ -58,12 +59,12 @@ pub enum UserRevsetEvaluationError {
     Evaluation(RevsetEvaluationError),
 }
 
-/// Wrapper around `RevsetExpression` to provide convenient methods.
+/// Wrapper around `UserRevsetExpression` to provide convenient methods.
 pub struct RevsetExpressionEvaluator<'repo> {
     repo: &'repo dyn Repo,
     extensions: Arc<RevsetExtensions>,
     id_prefix_context: &'repo IdPrefixContext,
-    expression: Rc<RevsetExpression>,
+    expression: Rc<UserRevsetExpression>,
 }
 
 impl<'repo> RevsetExpressionEvaluator<'repo> {
@@ -71,7 +72,7 @@ impl<'repo> RevsetExpressionEvaluator<'repo> {
         repo: &'repo dyn Repo,
         extensions: Arc<RevsetExtensions>,
         id_prefix_context: &'repo IdPrefixContext,
-        expression: Rc<RevsetExpression>,
+        expression: Rc<UserRevsetExpression>,
     ) -> Self {
         RevsetExpressionEvaluator {
             repo,
@@ -82,30 +83,42 @@ impl<'repo> RevsetExpressionEvaluator<'repo> {
     }
 
     /// Returns the underlying expression.
-    pub fn expression(&self) -> &Rc<RevsetExpression> {
+    pub fn expression(&self) -> &Rc<UserRevsetExpression> {
         &self.expression
     }
 
     /// Intersects the underlying expression with the `other` expression.
-    pub fn intersect_with(&mut self, other: &Rc<RevsetExpression>) {
+    pub fn intersect_with(&mut self, other: &Rc<UserRevsetExpression>) {
         self.expression = self.expression.intersection(other);
     }
 
-    /// Evaluates the expression.
-    pub fn evaluate(&self) -> Result<Box<dyn Revset + 'repo>, UserRevsetEvaluationError> {
+    /// Resolves user symbols in the expression, returns new expression.
+    pub fn resolve(&self) -> Result<Rc<ResolvedRevsetExpression>, RevsetResolutionError> {
         let symbol_resolver = default_symbol_resolver(
             self.repo,
             self.extensions.symbol_resolvers(),
             self.id_prefix_context,
         );
-        evaluate(self.repo, &symbol_resolver, self.expression.clone())
+        self.expression
+            .resolve_user_expression(self.repo, &symbol_resolver)
+    }
+
+    /// Evaluates the expression.
+    pub fn evaluate(&self) -> Result<Box<dyn Revset + 'repo>, UserRevsetEvaluationError> {
+        self.resolve()
+            .map_err(UserRevsetEvaluationError::Resolution)?
+            .evaluate(self.repo)
+            .map_err(UserRevsetEvaluationError::Evaluation)
     }
 
     /// Evaluates the expression to an iterator over commit ids. Entries are
     /// sorted in reverse topological order.
     pub fn evaluate_to_commit_ids(
         &self,
-    ) -> Result<Box<dyn Iterator<Item = CommitId> + 'repo>, UserRevsetEvaluationError> {
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<CommitId, RevsetEvaluationError>> + 'repo>,
+        UserRevsetEvaluationError,
+    > {
         Ok(self.evaluate()?.iter())
     }
 
@@ -113,20 +126,26 @@ impl<'repo> RevsetExpressionEvaluator<'repo> {
     /// sorted in reverse topological order.
     pub fn evaluate_to_commits(
         &self,
-    ) -> Result<impl Iterator<Item = BackendResult<Commit>> + 'repo, UserRevsetEvaluationError>
-    {
+    ) -> Result<
+        impl Iterator<Item = Result<Commit, RevsetEvaluationError>> + 'repo,
+        UserRevsetEvaluationError,
+    > {
         Ok(self.evaluate()?.iter().commits(self.repo.store()))
     }
 }
 
 fn warn_user_redefined_builtin(
     ui: &Ui,
-    source: &ConfigSource,
+    source: ConfigSource,
     name: &str,
 ) -> Result<(), CommandError> {
     match source {
         ConfigSource::Default => (),
-        ConfigSource::Env | ConfigSource::User | ConfigSource::Repo | ConfigSource::CommandArg => {
+        ConfigSource::EnvBase
+        | ConfigSource::User
+        | ConfigSource::Repo
+        | ConfigSource::EnvOverrides
+        | ConfigSource::CommandArg => {
             let checked_mutability_builtins =
                 ["mutable()", "immutable()", "builtin_immutable_heads()"];
 
@@ -145,20 +164,20 @@ fn warn_user_redefined_builtin(
 
 pub fn load_revset_aliases(
     ui: &Ui,
-    layered_configs: &LayeredConfigs,
+    stacked_config: &StackedConfig,
 ) -> Result<RevsetAliasesMap, CommandError> {
     const TABLE_KEY: &str = "revset-aliases";
     let mut aliases_map = RevsetAliasesMap::new();
     // Load from all config layers in order. 'f(x)' in default layer should be
     // overridden by 'f(a)' in user.
-    for (source, config) in layered_configs.sources() {
-        let table = if let Some(table) = config.get_table(TABLE_KEY).optional()? {
+    for layer in stacked_config.layers() {
+        let table = if let Some(table) = layer.data.get_table(TABLE_KEY).optional()? {
             table
         } else {
             continue;
         };
         for (decl, value) in table.into_iter().sorted_by(|a, b| a.0.cmp(&b.0)) {
-            warn_user_redefined_builtin(ui, &source, &decl)?;
+            warn_user_redefined_builtin(ui, layer.source, &decl)?;
 
             let r = value
                 .into_string()
@@ -176,19 +195,6 @@ pub fn load_revset_aliases(
     Ok(aliases_map)
 }
 
-pub fn evaluate<'a>(
-    repo: &'a dyn Repo,
-    symbol_resolver: &DefaultSymbolResolver,
-    expression: Rc<RevsetExpression>,
-) -> Result<Box<dyn Revset + 'a>, UserRevsetEvaluationError> {
-    let resolved = revset::optimize(expression)
-        .resolve_user_expression(repo, symbol_resolver)
-        .map_err(UserRevsetEvaluationError::Resolution)?;
-    resolved
-        .evaluate(repo)
-        .map_err(UserRevsetEvaluationError::Evaluation)
-}
-
 /// Wraps the given `IdPrefixContext` in `SymbolResolver` to be passed in to
 /// `evaluate()`.
 pub fn default_symbol_resolver<'a>(
@@ -204,13 +210,44 @@ pub fn default_symbol_resolver<'a>(
 pub fn parse_immutable_heads_expression(
     diagnostics: &mut RevsetDiagnostics,
     context: &RevsetParseContext,
-) -> Result<Rc<RevsetExpression>, RevsetParseError> {
+) -> Result<Rc<UserRevsetExpression>, RevsetParseError> {
     let (_, _, immutable_heads_str) = context
         .aliases_map()
         .get_function(USER_IMMUTABLE_HEADS, 0)
         .unwrap();
     let heads = revset::parse(diagnostics, immutable_heads_str, context)?;
     Ok(heads.union(&RevsetExpression::root()))
+}
+
+/// Prints warning if `trunk()` alias cannot be resolved. This alias could be
+/// generated by `jj git init`/`clone`.
+pub(super) fn warn_unresolvable_trunk(
+    ui: &Ui,
+    repo: &dyn Repo,
+    context: &RevsetParseContext,
+) -> io::Result<()> {
+    let (_, _, revset_str) = context
+        .aliases_map()
+        .get_function("trunk", 0)
+        .expect("trunk() should be defined by default");
+    let Ok(expression) = revset::parse(&mut RevsetDiagnostics::new(), revset_str, context) else {
+        // Parse error would have been reported.
+        return Ok(());
+    };
+    // Not using IdPrefixContext since trunk() revset shouldn't contain short
+    // prefixes.
+    let symbol_resolver = DefaultSymbolResolver::new(repo, context.symbol_resolvers());
+    if let Err(err) = expression.resolve_user_expression(repo, &symbol_resolver) {
+        writeln!(
+            ui.warning_default(),
+            "Failed to resolve `revset-aliases.trunk()`: {err}"
+        )?;
+        writeln!(
+            ui.hint_default(),
+            "Use `jj config edit --repo` to adjust the `trunk()` alias."
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn evaluate_revset_to_single_commit<'a>(
@@ -243,7 +280,7 @@ pub(super) fn evaluate_revset_to_single_commit<'a>(
 
 fn format_multiple_revisions_error(
     revision_str: &str,
-    expression: &RevsetExpression,
+    expression: &UserRevsetExpression,
     commits: &[Commit],
     elided: bool,
     template: &TemplateRenderer<'_, Commit>,
@@ -277,7 +314,7 @@ fn format_multiple_revisions_error(
             "Some of these commits have the same change id. Abandon one of them with `jj abandon \
              -r <REVISION>`.",
         );
-    } else if let RevsetExpression::CommitRef(RevsetCommitRef::Symbol(bookmark_name)) = expression {
+    } else if let Some(bookmark_name) = expression.as_symbol() {
         // Separate hint if there's a conflicted bookmark
         cmd_err.add_formatted_hint_with(|formatter| {
             writeln!(

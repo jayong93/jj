@@ -13,12 +13,16 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::io;
 
 use itertools::Itertools as _;
 use jj_lib::backend::Signature;
 use jj_lib::backend::Timestamp;
 use jj_lib::dsl_util::AliasExpandError as _;
+use jj_lib::time_util::DatePattern;
 
+use crate::formatter::FormatRecorder;
+use crate::formatter::Formatter;
 use crate::template_parser;
 use crate::template_parser::BinaryOp;
 use crate::template_parser::ExpressionKind;
@@ -39,6 +43,7 @@ use crate::templater::ListTemplate;
 use crate::templater::Literal;
 use crate::templater::PlainTextFormattedProperty;
 use crate::templater::PropertyPlaceholder;
+use crate::templater::RawEscapeSequenceTemplate;
 use crate::templater::ReformatTemplate;
 use crate::templater::SeparateTemplate;
 use crate::templater::SizeHint;
@@ -157,6 +162,9 @@ pub trait IntoTemplateProperty<'a> {
 
     fn try_into_plain_text(self) -> Option<Box<dyn TemplateProperty<Output = String> + 'a>>;
     fn try_into_template(self) -> Option<Box<dyn Template + 'a>>;
+
+    /// Transforms into a property that will evaluate to `self == other`.
+    fn try_into_eq(self, other: Self) -> Option<Box<dyn TemplateProperty<Output = bool> + 'a>>;
 }
 
 pub enum CoreTemplatePropertyKind<'a> {
@@ -259,6 +267,31 @@ impl<'a> IntoTemplateProperty<'a> for CoreTemplatePropertyKind<'a> {
             CoreTemplatePropertyKind::TimestampRange(property) => Some(property.into_template()),
             CoreTemplatePropertyKind::Template(template) => Some(template),
             CoreTemplatePropertyKind::ListTemplate(template) => Some(template.into_template()),
+        }
+    }
+
+    fn try_into_eq(self, other: Self) -> Option<Box<dyn TemplateProperty<Output = bool> + 'a>> {
+        match (self, other) {
+            (CoreTemplatePropertyKind::String(lhs), CoreTemplatePropertyKind::String(rhs)) => {
+                Some(Box::new((lhs, rhs).map(|(l, r)| l == r)))
+            }
+            (CoreTemplatePropertyKind::Boolean(lhs), CoreTemplatePropertyKind::Boolean(rhs)) => {
+                Some(Box::new((lhs, rhs).map(|(l, r)| l == r)))
+            }
+            (CoreTemplatePropertyKind::Integer(lhs), CoreTemplatePropertyKind::Integer(rhs)) => {
+                Some(Box::new((lhs, rhs).map(|(l, r)| l == r)))
+            }
+            (CoreTemplatePropertyKind::String(_), _) => None,
+            (CoreTemplatePropertyKind::StringList(_), _) => None,
+            (CoreTemplatePropertyKind::Boolean(_), _) => None,
+            (CoreTemplatePropertyKind::Integer(_), _) => None,
+            (CoreTemplatePropertyKind::IntegerOpt(_), _) => None,
+            (CoreTemplatePropertyKind::Signature(_), _) => None,
+            (CoreTemplatePropertyKind::SizeHint(_), _) => None,
+            (CoreTemplatePropertyKind::Timestamp(_), _) => None,
+            (CoreTemplatePropertyKind::TimestampRange(_), _) => None,
+            (CoreTemplatePropertyKind::Template(_), _) => None,
+            (CoreTemplatePropertyKind::ListTemplate(_), _) => None,
         }
     }
 }
@@ -503,6 +536,10 @@ impl<'a, P: IntoTemplateProperty<'a>> Expression<P> {
             Some(Box::new(LabelTemplate::new(template, Literal(self.labels))))
         }
     }
+
+    pub fn try_into_eq(self, other: Self) -> Option<Box<dyn TemplateProperty<Output = bool> + 'a>> {
+        self.property.try_into_eq(other.property)
+    }
 }
 
 pub struct BuildContext<'i, P> {
@@ -586,6 +623,7 @@ fn build_binary_operation<'a, L: TemplateLanguage<'a> + ?Sized>(
     op: BinaryOp,
     lhs_node: &ExpressionNode,
     rhs_node: &ExpressionNode,
+    span: pest::Span<'_>,
 ) -> TemplateParseResult<L::Property> {
     match op {
         BinaryOp::LogicalOr => {
@@ -599,6 +637,21 @@ fn build_binary_operation<'a, L: TemplateLanguage<'a> + ?Sized>(
             let rhs = expect_boolean_expression(language, diagnostics, build_ctx, rhs_node)?;
             let out = lhs.and_then(move |l| Ok(l && rhs.extract()?));
             Ok(L::wrap_boolean(out))
+        }
+        BinaryOp::LogicalEq | BinaryOp::LogicalNe => {
+            let lhs = build_expression(language, diagnostics, build_ctx, lhs_node)?;
+            let rhs = build_expression(language, diagnostics, build_ctx, rhs_node)?;
+            let lty = lhs.type_name();
+            let rty = rhs.type_name();
+            let out = lhs.try_into_eq(rhs).ok_or_else(|| {
+                let message = format!(r#"Cannot compare expressions of type "{lty}" and "{rty}""#);
+                TemplateParseError::expression(message, span)
+            })?;
+            match op {
+                BinaryOp::LogicalEq => Ok(L::wrap_boolean(out)),
+                BinaryOp::LogicalNe => Ok(L::wrap_boolean(out.map(|eq| !eq))),
+                _ => unreachable!(),
+            }
         }
     }
 }
@@ -899,6 +952,25 @@ fn builtin_timestamp_methods<'a, L: TemplateLanguage<'a> + ?Sized>(
             Ok(L::wrap_timestamp(out_property))
         },
     );
+    map.insert(
+        "after",
+        |_language, _diagnostics, _build_ctx, self_property, function| {
+            let [date_pattern_node] = function.expect_exact_arguments()?;
+            let now = chrono::Local::now();
+            let date_pattern = template_parser::expect_string_literal_with(
+                date_pattern_node,
+                |date_pattern, span| {
+                    DatePattern::from_str_kind(date_pattern, function.name, now).map_err(|err| {
+                        TemplateParseError::expression("Invalid date pattern", span)
+                            .with_source(err)
+                    })
+                },
+            )?;
+            let out_property = self_property.map(move |timestamp| date_pattern.matches(&timestamp));
+            Ok(L::wrap_boolean(out_property))
+        },
+    );
+    map.insert("before", map["after"]);
     map
 }
 
@@ -1105,6 +1177,50 @@ fn builtin_functions<'a, L: TemplateLanguage<'a> + ?Sized>() -> TemplateBuildFun
         });
         Ok(L::wrap_template(Box::new(template)))
     });
+    map.insert("pad_start", |language, diagnostics, build_ctx, function| {
+        let ([width_node, content_node], [fill_char_node]) =
+            function.expect_named_arguments(&["", "", "fill_char"])?;
+        let width = expect_usize_expression(language, diagnostics, build_ctx, width_node)?;
+        let content = expect_template_expression(language, diagnostics, build_ctx, content_node)?;
+        let fill_char = fill_char_node
+            .map(|node| expect_template_expression(language, diagnostics, build_ctx, node))
+            .transpose()?;
+        let template = new_pad_template(content, fill_char, width, text_util::write_padded_start);
+        Ok(L::wrap_template(template))
+    });
+    map.insert("pad_end", |language, diagnostics, build_ctx, function| {
+        let ([width_node, content_node], [fill_char_node]) =
+            function.expect_named_arguments(&["", "", "fill_char"])?;
+        let width = expect_usize_expression(language, diagnostics, build_ctx, width_node)?;
+        let content = expect_template_expression(language, diagnostics, build_ctx, content_node)?;
+        let fill_char = fill_char_node
+            .map(|node| expect_template_expression(language, diagnostics, build_ctx, node))
+            .transpose()?;
+        let template = new_pad_template(content, fill_char, width, text_util::write_padded_end);
+        Ok(L::wrap_template(template))
+    });
+    map.insert(
+        "truncate_start",
+        |language, diagnostics, build_ctx, function| {
+            let [width_node, content_node] = function.expect_exact_arguments()?;
+            let width = expect_usize_expression(language, diagnostics, build_ctx, width_node)?;
+            let content =
+                expect_template_expression(language, diagnostics, build_ctx, content_node)?;
+            let template = new_truncate_template(content, width, text_util::write_truncated_start);
+            Ok(L::wrap_template(template))
+        },
+    );
+    map.insert(
+        "truncate_end",
+        |language, diagnostics, build_ctx, function| {
+            let [width_node, content_node] = function.expect_exact_arguments()?;
+            let width = expect_usize_expression(language, diagnostics, build_ctx, width_node)?;
+            let content =
+                expect_template_expression(language, diagnostics, build_ctx, content_node)?;
+            let template = new_truncate_template(content, width, text_util::write_truncated_end);
+            Ok(L::wrap_template(template))
+        },
+    );
     map.insert("label", |language, diagnostics, build_ctx, function| {
         let [label_node, content_node] = function.expect_exact_arguments()?;
         let label_property =
@@ -1116,6 +1232,17 @@ fn builtin_functions<'a, L: TemplateLanguage<'a> + ?Sized>() -> TemplateBuildFun
             content, labels,
         ))))
     });
+    map.insert(
+        "raw_escape_sequence",
+        |language, diagnostics, build_ctx, function| {
+            let [content_node] = function.expect_exact_arguments()?;
+            let content =
+                expect_template_expression(language, diagnostics, build_ctx, content_node)?;
+            Ok(L::wrap_template(Box::new(RawEscapeSequenceTemplate(
+                content,
+            ))))
+        },
+    );
     map.insert("if", |language, diagnostics, build_ctx, function| {
         let ([condition_node, true_node], [false_node]) = function.expect_arguments()?;
         let condition =
@@ -1175,6 +1302,54 @@ fn builtin_functions<'a, L: TemplateLanguage<'a> + ?Sized>() -> TemplateBuildFun
     map
 }
 
+fn new_pad_template<'a, W>(
+    content: Box<dyn Template + 'a>,
+    fill_char: Option<Box<dyn Template + 'a>>,
+    width: Box<dyn TemplateProperty<Output = usize> + 'a>,
+    write_padded: W,
+) -> Box<dyn Template + 'a>
+where
+    W: Fn(&mut dyn Formatter, &FormatRecorder, &FormatRecorder, usize) -> io::Result<()> + 'a,
+{
+    let default_fill_char = FormatRecorder::with_data(" ");
+    let template = ReformatTemplate::new(content, move |formatter, recorded| {
+        let width = match width.extract() {
+            Ok(width) => width,
+            Err(err) => return formatter.handle_error(err),
+        };
+        let mut fill_char_recorder;
+        let recorded_fill_char = if let Some(fill_char) = &fill_char {
+            let rewrap = formatter.rewrap_fn();
+            fill_char_recorder = FormatRecorder::new();
+            fill_char.format(&mut rewrap(&mut fill_char_recorder))?;
+            &fill_char_recorder
+        } else {
+            &default_fill_char
+        };
+        write_padded(formatter.as_mut(), recorded, recorded_fill_char, width)
+    });
+    Box::new(template)
+}
+
+fn new_truncate_template<'a, W>(
+    content: Box<dyn Template + 'a>,
+    width: Box<dyn TemplateProperty<Output = usize> + 'a>,
+    write_truncated: W,
+) -> Box<dyn Template + 'a>
+where
+    W: Fn(&mut dyn Formatter, &FormatRecorder, usize) -> io::Result<usize> + 'a,
+{
+    let template = ReformatTemplate::new(content, move |formatter, recorded| {
+        let width = match width.extract() {
+            Ok(width) => width,
+            Err(err) => return formatter.handle_error(err),
+        };
+        write_truncated(formatter.as_mut(), recorded, width)?;
+        Ok(())
+    });
+    Box::new(template)
+}
+
 /// Builds intermediate expression tree from AST nodes.
 pub fn build_expression<'a, L: TemplateLanguage<'a> + ?Sized>(
     language: &L,
@@ -1219,8 +1394,15 @@ pub fn build_expression<'a, L: TemplateLanguage<'a> + ?Sized>(
             Ok(Expression::unlabeled(property))
         }
         ExpressionKind::Binary(op, lhs_node, rhs_node) => {
-            let property =
-                build_binary_operation(language, diagnostics, build_ctx, *op, lhs_node, rhs_node)?;
+            let property = build_binary_operation(
+                language,
+                diagnostics,
+                build_ctx,
+                *op,
+                lhs_node,
+                rhs_node,
+                node.span,
+            )?;
             Ok(Expression::unlabeled(property))
         }
         ExpressionKind::Concat(nodes) => {
@@ -1550,14 +1732,14 @@ mod tests {
         env.add_keyword("description", || L::wrap_string(Literal("".to_owned())));
         env.add_keyword("empty", || L::wrap_boolean(Literal(true)));
 
-        insta::assert_snapshot!(env.parse_err(r#"description ()"#), @r###"
+        insta::assert_snapshot!(env.parse_err(r#"description ()"#), @r"
          --> 1:13
           |
         1 | description ()
           |             ^---
           |
-          = expected <EOI>, `++`, `||`, or `&&`
-        "###);
+          = expected <EOI>, `++`, `||`, `&&`, `==`, or `!=`
+        ");
 
         insta::assert_snapshot!(env.parse_err(r#"foo"#), @r###"
          --> 1:1
@@ -1601,6 +1783,62 @@ mod tests {
           |
           = Expected expression of type "Boolean", but actual type is "Integer"
         "###);
+        insta::assert_snapshot!(env.parse_err(r#"true == 1"#), @r#"
+         --> 1:1
+          |
+        1 | true == 1
+          | ^-------^
+          |
+          = Cannot compare expressions of type "Boolean" and "Integer"
+        "#);
+        insta::assert_snapshot!(env.parse_err(r#"true != 'a'"#), @r#"
+         --> 1:1
+          |
+        1 | true != 'a'
+          | ^---------^
+          |
+          = Cannot compare expressions of type "Boolean" and "String"
+        "#);
+        insta::assert_snapshot!(env.parse_err(r#"1 == true"#), @r#"
+         --> 1:1
+          |
+        1 | 1 == true
+          | ^-------^
+          |
+          = Cannot compare expressions of type "Integer" and "Boolean"
+        "#);
+        insta::assert_snapshot!(env.parse_err(r#"1 != 'a'"#), @r#"
+         --> 1:1
+          |
+        1 | 1 != 'a'
+          | ^------^
+          |
+          = Cannot compare expressions of type "Integer" and "String"
+        "#);
+        insta::assert_snapshot!(env.parse_err(r#"'a' == true"#), @r#"
+         --> 1:1
+          |
+        1 | 'a' == true
+          | ^---------^
+          |
+          = Cannot compare expressions of type "String" and "Boolean"
+        "#);
+        insta::assert_snapshot!(env.parse_err(r#"'a' != 1"#), @r#"
+         --> 1:1
+          |
+        1 | 'a' != 1
+          | ^------^
+          |
+          = Cannot compare expressions of type "String" and "Integer"
+        "#);
+        insta::assert_snapshot!(env.parse_err(r#"'a' == label("", "")"#), @r#"
+         --> 1:1
+          |
+        1 | 'a' == label("", "")
+          | ^------------------^
+          |
+          = Cannot compare expressions of type "String" and "Template"
+        "#);
 
         insta::assert_snapshot!(env.parse_err(r#"description.first_line().foo()"#), @r###"
          --> 1:26
@@ -1696,6 +1934,15 @@ mod tests {
           |
           = Function "if": Expected 2 to 3 arguments
         "###);
+
+        insta::assert_snapshot!(env.parse_err(r#"pad_start("foo", fill_char = "bar", "baz")"#), @r#"
+         --> 1:37
+          |
+        1 | pad_start("foo", fill_char = "bar", "baz")
+          |                                     ^---^
+          |
+          = Function "pad_start": Positional argument follows keyword argument
+        "#);
 
         insta::assert_snapshot!(env.parse_err(r#"if(label("foo", "bar"), "baz")"#), @r###"
          --> 1:4
@@ -1809,6 +2056,18 @@ mod tests {
         insta::assert_snapshot!(env.render_ok(r#"!false"#), @"true");
         insta::assert_snapshot!(env.render_ok(r#"false || !false"#), @"true");
         insta::assert_snapshot!(env.render_ok(r#"false && true"#), @"false");
+        insta::assert_snapshot!(env.render_ok(r#"true == true"#), @"true");
+        insta::assert_snapshot!(env.render_ok(r#"true == false"#), @"false");
+        insta::assert_snapshot!(env.render_ok(r#"true != true"#), @"false");
+        insta::assert_snapshot!(env.render_ok(r#"true != false"#), @"true");
+        insta::assert_snapshot!(env.render_ok(r#"1 == 1"#), @"true");
+        insta::assert_snapshot!(env.render_ok(r#"1 == 2"#), @"false");
+        insta::assert_snapshot!(env.render_ok(r#"1 != 1"#), @"false");
+        insta::assert_snapshot!(env.render_ok(r#"1 != 2"#), @"true");
+        insta::assert_snapshot!(env.render_ok(r#"'a' == 'a'"#), @"true");
+        insta::assert_snapshot!(env.render_ok(r#"'a' == 'b'"#), @"false");
+        insta::assert_snapshot!(env.render_ok(r#"'a' != 'a'"#), @"false");
+        insta::assert_snapshot!(env.render_ok(r#"'a' != 'b'"#), @"true");
 
         insta::assert_snapshot!(env.render_ok(r#" !"" "#), @"true");
         insta::assert_snapshot!(env.render_ok(r#" "" || "a".lines() "#), @"true");
@@ -2312,6 +2571,52 @@ mod tests {
     }
 
     #[test]
+    fn test_pad_function() {
+        let mut env = TestTemplateEnv::new();
+        env.add_keyword("bad_string", || L::wrap_string(new_error_property("Bad")));
+        env.add_color("red", crossterm::style::Color::Red);
+        env.add_color("cyan", crossterm::style::Color::DarkCyan);
+
+        // Default fill_char is ' '
+        insta::assert_snapshot!(
+            env.render_ok(r"'{' ++ pad_start(5, label('red', 'foo')) ++ '}'"),
+            @"{  [38;5;9mfoo[39m}");
+        insta::assert_snapshot!(
+            env.render_ok(r"'{' ++ pad_end(5, label('red', 'foo')) ++ '}'"),
+            @"{[38;5;9mfoo[39m  }");
+
+        // Labeled fill char
+        insta::assert_snapshot!(
+            env.render_ok(r"pad_start(5, label('red', 'foo'), fill_char=label('cyan', '='))"),
+            @"[38;5;6m==[39m[38;5;9mfoo[39m");
+        insta::assert_snapshot!(
+            env.render_ok(r"pad_end(5, label('red', 'foo'), fill_char=label('cyan', '='))"),
+            @"[38;5;9mfoo[39m[38;5;6m==[39m");
+
+        // Error in fill char: the output looks odd (because the error message
+        // isn't 1-width character), but is still readable.
+        insta::assert_snapshot!(
+            env.render_ok(r"pad_start(3, 'foo', fill_char=bad_string)"),
+            @"foo");
+        insta::assert_snapshot!(
+            env.render_ok(r"pad_end(5, 'foo', fill_char=bad_string)"),
+            @"foo<<Error: Error: Bad>Bad>");
+    }
+
+    #[test]
+    fn test_truncate_function() {
+        let mut env = TestTemplateEnv::new();
+        env.add_color("red", crossterm::style::Color::Red);
+
+        insta::assert_snapshot!(
+            env.render_ok(r"truncate_start(2, label('red', 'foobar')) ++ 'baz'"),
+            @"[38;5;9mar[39mbaz");
+        insta::assert_snapshot!(
+            env.render_ok(r"truncate_end(2, label('red', 'foobar')) ++ 'baz'"),
+            @"[38;5;9mfo[39mbaz");
+    }
+
+    #[test]
     fn test_label_function() {
         let mut env = TestTemplateEnv::new();
         env.add_keyword("empty", || L::wrap_boolean(Literal(true)));
@@ -2332,6 +2637,47 @@ mod tests {
         insta::assert_snapshot!(
             env.render_ok(r#"label(if(empty, "error", "warning"), "text")"#),
             @"[38;5;1mtext[39m");
+    }
+
+    #[test]
+    fn test_raw_escape_sequence_function_strip_labels() {
+        let mut env = TestTemplateEnv::new();
+        env.add_color("error", crossterm::style::Color::DarkRed);
+        env.add_color("warning", crossterm::style::Color::DarkYellow);
+
+        insta::assert_snapshot!(
+            env.render_ok(r#"raw_escape_sequence(label("error warning", "text"))"#),
+            @"text",
+        );
+    }
+
+    #[test]
+    fn test_raw_escape_sequence_function_ansi_escape() {
+        let env = TestTemplateEnv::new();
+
+        // Sanitize ANSI escape without raw_escape_sequence
+        insta::assert_snapshot!(env.render_ok(r#""\e""#), @"␛");
+        insta::assert_snapshot!(env.render_ok(r#""\x1b""#), @"␛");
+        insta::assert_snapshot!(env.render_ok(r#""\x1B""#), @"␛");
+        insta::assert_snapshot!(
+            env.render_ok(r#""]8;;"
+                ++ "http://example.com"
+                ++ "\e\\"
+                ++ "Example"
+                ++ "\x1b]8;;\x1B\\""#),
+            @r#"␛]8;;http://example.com␛\Example␛]8;;␛\"#);
+
+        // Don't sanitize ANSI escape with raw_escape_sequence
+        insta::assert_snapshot!(env.render_ok(r#"raw_escape_sequence("\e")"#), @"");
+        insta::assert_snapshot!(env.render_ok(r#"raw_escape_sequence("\x1b")"#), @"");
+        insta::assert_snapshot!(env.render_ok(r#"raw_escape_sequence("\x1B")"#), @"");
+        insta::assert_snapshot!(
+            env.render_ok(r#"raw_escape_sequence("]8;;"
+                ++ "http://example.com"
+                ++ "\e\\"
+                ++ "Example"
+                ++ "\x1b]8;;\x1B\\")"#),
+            @r#"]8;;http://example.com\Example]8;;\"#);
     }
 
     #[test]

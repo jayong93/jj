@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use clap_complete::ArgValueCandidates;
+use clap_complete::ArgValueCompleter;
 use itertools::Itertools as _;
 use jj_lib::commit::Commit;
 use jj_lib::commit::CommitIteratorExt;
 use jj_lib::matchers::Matcher;
-use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
+use jj_lib::rewrite;
 use jj_lib::settings::UserSettings;
 use tracing::instrument;
 
@@ -29,6 +31,7 @@ use crate::cli_util::WorkspaceCommandTransaction;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_hint;
 use crate::command_error::CommandError;
+use crate::complete;
 use crate::description_util::combine_messages;
 use crate::description_util::join_message_paragraphs;
 use crate::ui::Ui;
@@ -57,13 +60,22 @@ use crate::ui::Ui;
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct SquashArgs {
     /// Revision to squash into its parent (default: @)
-    #[arg(long, short)]
+    #[arg(long, short, add = ArgValueCandidates::new(complete::mutable_revisions))]
     revision: Option<RevisionArg>,
     /// Revision(s) to squash from (default: @)
-    #[arg(long, conflicts_with = "revision")]
+    #[arg(
+        long, short,
+        conflicts_with = "revision",
+        add = ArgValueCandidates::new(complete::mutable_revisions),
+    )]
     from: Vec<RevisionArg>,
     /// Revision to squash into (default: @)
-    #[arg(long, conflicts_with = "revision", visible_alias = "to")]
+    #[arg(
+        long, short = 't',
+        conflicts_with = "revision",
+        visible_alias = "to",
+        add = ArgValueCandidates::new(complete::mutable_revisions),
+    )]
     into: Option<RevisionArg>,
     /// The description to use for squashed revision (don't open editor)
     #[arg(long = "message", short, value_name = "MESSAGE")]
@@ -79,7 +91,11 @@ pub(crate) struct SquashArgs {
     #[arg(long, value_name = "NAME")]
     tool: Option<String>,
     /// Move only changes to these paths (instead of all paths)
-    #[arg(conflicts_with_all = ["interactive", "tool"], value_hint = clap::ValueHint::AnyPath)]
+    #[arg(
+        conflicts_with_all = ["interactive", "tool"],
+        value_hint = clap::ValueHint::AnyPath,
+        add = ArgValueCompleter::new(complete::squash_revision_files),
+    )]
     paths: Vec<String>,
     /// The source revision will not be abandoned
     #[arg(long, short)]
@@ -151,8 +167,7 @@ pub(crate) fn cmd_squash(
     Ok(())
 }
 
-// TODO(#2882): Remove public visibility once `jj move` is deleted.
-pub(crate) enum SquashedDescription {
+enum SquashedDescription {
     // Use this exact description.
     Exact(String),
     // Use the destination's description and discard the descriptions of the
@@ -162,9 +177,8 @@ pub(crate) enum SquashedDescription {
     Combine,
 }
 
-// TODO(#2882): Remove public visibility once `jj move` is deleted.
 impl SquashedDescription {
-    pub(crate) fn from_args(args: &SquashArgs) -> Self {
+    fn from_args(args: &SquashArgs) -> Self {
         // These options are incompatible and Clap is configured to prevent this.
         assert!(args.message_paragraphs.is_empty() || !args.use_destination_message);
 
@@ -180,7 +194,7 @@ impl SquashedDescription {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn move_diff(
+fn move_diff(
     ui: &mut Ui,
     tx: &mut WorkspaceCommandTransaction,
     settings: &UserSettings,
@@ -196,12 +210,6 @@ pub fn move_diff(
     tx.base_workspace_helper()
         .check_rewritable(sources.iter().chain(std::iter::once(destination)).ids())?;
 
-    struct SourceCommit<'a> {
-        commit: &'a Commit,
-        parent_tree: MergedTree,
-        selected_tree: MergedTree,
-        abandon: bool,
-    }
     let mut source_commits = vec![];
     for source in sources {
         let parent_tree = source.parent_tree(tx.repo())?;
@@ -227,105 +235,52 @@ from the source will be moved into the destination.
         let selected_tree_id =
             diff_selector.select(&parent_tree, &source_tree, matcher, format_instructions)?;
         let selected_tree = tx.repo().store().get_root_tree(&selected_tree_id)?;
-        let abandon = !keep_emptied && selected_tree.id() == source_tree.id();
-        if !abandon && selected_tree_id == parent_tree.id() {
-            // Nothing selected from this commit. If it's abandoned (i.e. already empty), we
-            // still include it so `jj squash` can be used for abandoning an empty commit in
-            // the middle of a stack.
-            continue;
-        }
-        // TODO: Do we want to optimize the case of moving to the parent commit (`jj
-        // squash -r`)? The source tree will be unchanged in that case.
-        source_commits.push(SourceCommit {
-            commit: source,
-            parent_tree,
+
+        source_commits.push(rewrite::CommitToSquash {
+            commit: source.clone(),
             selected_tree,
-            abandon,
+            parent_tree,
         });
     }
-    if source_commits.is_empty() {
-        if diff_selector.is_interactive() {
-            return Err(user_error("No changes selected"));
-        }
 
-        if let [only_path] = path_arg {
-            if no_rev_arg
-                && tx
-                    .base_workspace_helper()
-                    .parse_revset(ui, &RevisionArg::from(only_path.to_owned()))
-                    .is_ok()
-            {
-                writeln!(
-                    ui.warning_default(),
-                    "The argument {only_path:?} is being interpreted as a path. To specify a \
-                     revset, pass -r {only_path:?} instead."
-                )?;
+    let repo_path = tx.base_workspace_helper().repo_path().to_owned();
+    match rewrite::squash_commits(
+        settings,
+        tx.repo_mut(),
+        &source_commits,
+        destination,
+        keep_emptied,
+        |abandoned_commits| match description {
+            SquashedDescription::Exact(description) => Ok(description),
+            SquashedDescription::UseDestination => Ok(destination.description().to_owned()),
+            SquashedDescription::Combine => {
+                let abandoned_commits = abandoned_commits.iter().map(|c| &c.commit).collect_vec();
+                combine_messages(&repo_path, &abandoned_commits, destination, settings)
             }
-        }
+        },
+    )? {
+        rewrite::SquashResult::NoChanges => {
+            if diff_selector.is_interactive() {
+                return Err(user_error("No changes selected"));
+            }
 
-        return Ok(());
-    }
+            if let [only_path] = path_arg {
+                if no_rev_arg
+                    && tx
+                        .base_workspace_helper()
+                        .parse_revset(ui, &RevisionArg::from(only_path.to_owned()))
+                        .is_ok()
+                {
+                    writeln!(
+                        ui.warning_default(),
+                        "The argument {only_path:?} is being interpreted as a path. To specify a \
+                         revset, pass -r {only_path:?} instead."
+                    )?;
+                }
+            }
 
-    for source in &source_commits {
-        if source.abandon {
-            tx.repo_mut()
-                .record_abandoned_commit(source.commit.id().clone());
-        } else {
-            let source_tree = source.commit.tree()?;
-            // Apply the reverse of the selected changes onto the source
-            let new_source_tree = source_tree.merge(&source.selected_tree, &source.parent_tree)?;
-            tx.repo_mut()
-                .rewrite_commit(settings, source.commit)
-                .set_tree_id(new_source_tree.id().clone())
-                .write()?;
+            Ok(())
         }
+        rewrite::SquashResult::NewCommit(_) => Ok(()),
     }
-
-    let mut rewritten_destination = destination.clone();
-    if sources
-        .iter()
-        .any(|source| tx.repo().index().is_ancestor(source.id(), destination.id()))
-    {
-        // If we're moving changes to a descendant, first rebase descendants onto the
-        // rewritten sources. Otherwise it will likely already have the content
-        // changes we're moving, so applying them will have no effect and the
-        // changes will disappear.
-        let rebase_map = tx.repo_mut().rebase_descendants_return_map(settings)?;
-        let rebased_destination_id = rebase_map.get(destination.id()).unwrap().clone();
-        rewritten_destination = tx.repo().store().get_commit(&rebased_destination_id)?;
-    }
-    // Apply the selected changes onto the destination
-    let mut destination_tree = rewritten_destination.tree()?;
-    for source in &source_commits {
-        destination_tree = destination_tree.merge(&source.parent_tree, &source.selected_tree)?;
-    }
-    let description = match description {
-        SquashedDescription::Exact(description) => description,
-        SquashedDescription::UseDestination => destination.description().to_owned(),
-        SquashedDescription::Combine => {
-            let abandoned_commits = source_commits
-                .iter()
-                .filter_map(|source| source.abandon.then_some(source.commit))
-                .collect_vec();
-            combine_messages(
-                tx.base_workspace_helper(),
-                &abandoned_commits,
-                destination,
-                settings,
-            )?
-        }
-    };
-    let mut predecessors = vec![destination.id().clone()];
-    predecessors.extend(
-        source_commits
-            .iter()
-            .map(|source| source.commit.id().clone()),
-    );
-    tx.repo_mut()
-        .rewrite_commit(settings, &rewritten_destination)
-        .set_tree_id(destination_tree.id().clone())
-        .set_predecessors(predecessors)
-        .set_description(description)
-        .write()?;
-    Ok(())
 }

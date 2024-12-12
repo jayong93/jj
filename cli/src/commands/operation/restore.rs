@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use clap_complete::ArgValueCandidates;
 use jj_lib::object_id::ObjectId;
 
 use super::view_with_desired_portions_restored;
@@ -19,6 +20,7 @@ use super::UndoWhatToRestore;
 use super::DEFAULT_UNDO_WHAT;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
+use crate::complete;
 use crate::ui::Ui;
 
 /// Create a new operation that restores the repo to an earlier state
@@ -32,6 +34,7 @@ pub struct OperationRestoreArgs {
     /// Use `jj op log` to find an operation to restore to. Use e.g. `jj
     /// --at-op=<operation ID> log` before restoring to an operation to see the
     /// state of the repo at that operation.
+    #[arg(add = ArgValueCandidates::new(complete::operations))]
     operation: String,
 
     /// What portions of the local state to restore (can be repeated)
@@ -56,7 +59,7 @@ pub fn cmd_op_restore(
     );
     tx.repo_mut().set_view(new_view);
     if let Some(mut formatter) = ui.status_formatter() {
-        write!(formatter, "Restored to operation ")?;
+        write!(formatter, "Restored to operation: ")?;
         let template = tx.base_workspace_helper().operation_summary_template();
         template.format(&target_op, formatter.as_mut())?;
         writeln!(formatter)?;

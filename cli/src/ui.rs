@@ -32,6 +32,8 @@ use std::thread::JoinHandle;
 
 use indoc::indoc;
 use itertools::Itertools as _;
+use jj_lib::config::ConfigError;
+use jj_lib::config::StackedConfig;
 use minus::MinusError;
 use minus::Pager as MinusPager;
 use tracing::instrument;
@@ -261,8 +263,8 @@ pub struct Ui {
     output: UiOutput,
 }
 
-fn progress_indicator_setting(config: &config::Config) -> bool {
-    config.get_bool("ui.progress-indicator").unwrap_or(true)
+fn progress_indicator_setting(config: &StackedConfig) -> bool {
+    config.get("ui.progress-indicator").unwrap_or(true)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -300,18 +302,18 @@ impl fmt::Display for ColorChoice {
     }
 }
 
-fn color_setting(config: &config::Config) -> ColorChoice {
+fn color_setting(config: &StackedConfig) -> ColorChoice {
     config
-        .get_string("ui.color")
+        .get::<String>("ui.color")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_default()
 }
 
 fn prepare_formatter_factory(
-    config: &config::Config,
+    config: &StackedConfig,
     stdout: &Stdout,
-) -> Result<FormatterFactory, config::ConfigError> {
+) -> Result<FormatterFactory, ConfigError> {
     let terminal = stdout.is_terminal();
     let (color, debug) = match color_setting(config) {
         ColorChoice::Always => (true, false),
@@ -330,8 +332,8 @@ fn prepare_formatter_factory(
     }
 }
 
-fn be_quiet(config: &config::Config) -> bool {
-    config.get_bool("ui.quiet").unwrap_or_default()
+fn be_quiet(config: &StackedConfig) -> bool {
+    config.get("ui.quiet").unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
@@ -342,20 +344,20 @@ pub enum PaginationChoice {
     Auto,
 }
 
-fn pagination_setting(config: &config::Config) -> Result<PaginationChoice, CommandError> {
+fn pagination_setting(config: &StackedConfig) -> Result<PaginationChoice, CommandError> {
     config
         .get::<PaginationChoice>("ui.paginate")
         .map_err(|err| config_error_with_message("Invalid `ui.paginate`", err))
 }
 
-fn pager_setting(config: &config::Config) -> Result<CommandNameAndArgs, CommandError> {
+fn pager_setting(config: &StackedConfig) -> Result<CommandNameAndArgs, CommandError> {
     config
         .get::<CommandNameAndArgs>("ui.pager")
         .map_err(|err| config_error_with_message("Invalid `ui.pager`", err))
 }
 
 impl Ui {
-    pub fn with_config(config: &config::Config) -> Result<Ui, CommandError> {
+    pub fn with_config(config: &StackedConfig) -> Result<Ui, CommandError> {
         let quiet = be_quiet(config);
         let formatter_factory = prepare_formatter_factory(config, &io::stdout())?;
         let progress_indicator = progress_indicator_setting(config);
@@ -369,7 +371,7 @@ impl Ui {
         })
     }
 
-    pub fn reset(&mut self, config: &config::Config) -> Result<(), CommandError> {
+    pub fn reset(&mut self, config: &StackedConfig) -> Result<(), CommandError> {
         self.quiet = be_quiet(config);
         self.paginate = pagination_setting(config)?;
         self.pager_cmd = pager_setting(config)?;
@@ -560,14 +562,12 @@ impl Ui {
     }
 
     pub fn can_prompt() -> bool {
-        io::stdout().is_terminal()
+        io::stderr().is_terminal()
             || env::var("JJ_INTERACTIVE")
                 .map(|v| v == "1")
                 .unwrap_or(false)
     }
 
-    #[allow(unknown_lints)] // XXX FIXME (aseipp): nightly bogons; re-test this occasionally
-    #[allow(clippy::assigning_clones)]
     pub fn prompt(&self, prompt: &str) -> io::Result<String> {
         if !Self::can_prompt() {
             return Err(io::Error::new(
@@ -575,20 +575,21 @@ impl Ui {
                 "Cannot prompt for input since the output is not connected to a terminal",
             ));
         }
-        write!(self.stdout(), "{prompt}: ")?;
-        self.stdout().flush()?;
+        write!(self.stderr(), "{prompt}: ")?;
+        self.stderr().flush()?;
         let mut buf = String::new();
         io::stdin().read_line(&mut buf)?;
 
-        if let Some(trimmed) = buf.strip_suffix('\n') {
-            buf = trimmed.to_owned();
-        } else if buf.is_empty() {
+        if buf.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Prompt cancelled by EOF",
             ));
         }
 
+        if let Some(trimmed) = buf.strip_suffix('\n') {
+            buf.truncate(trimmed.len());
+        }
         Ok(buf)
     }
 
@@ -602,7 +603,7 @@ impl Ui {
         if !Self::can_prompt() {
             if let Some(default) = default {
                 // Choose the default automatically without waiting.
-                writeln!(self.stdout(), "{prompt}: {default}")?;
+                writeln!(self.stderr(), "{prompt}: {default}")?;
                 return Ok(default.to_owned());
             }
         }
@@ -632,7 +633,7 @@ impl Ui {
         let default_choice = default.map(|c| if c { "Y" } else { "N" });
 
         let choice = self.prompt_choice(
-            &format!("{} {}", prompt, default_str),
+            &format!("{prompt} {default_str}"),
             &["y", "n", "yes", "no", "Yes", "No", "YES", "NO"],
             default_choice,
         )?;

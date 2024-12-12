@@ -292,6 +292,31 @@ fn test_bad_path() {
 }
 
 #[test]
+fn test_invalid_filesets_looking_like_filepaths() {
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
+    let repo_path = test_env.env_root().join("repo");
+
+    let stderr = test_env.jj_cmd_failure(&repo_path, &["file", "show", "abc~"]);
+    insta::assert_snapshot!(stderr, @r#"
+    Error: Failed to parse fileset: Syntax error
+    Caused by:  --> 1:5
+      |
+    1 | abc~
+      |     ^---
+      |
+      = expected `~` or <primary>
+    Hint: See https://martinvonz.github.io/jj/latest/filesets/ for filesets syntax, or for how to match file paths.
+    "#);
+
+    test_env.add_config(r#"ui.allow-filesets=false"#);
+    let stderr = test_env.jj_cmd_failure(&repo_path, &["file", "show", "abc~"]);
+    insta::assert_snapshot!(stderr, @r#"
+    Error: No such path: abc~
+    "#);
+}
+
+#[test]
 fn test_broken_repo_structure() {
     let test_env = TestEnvironment::default();
     test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
@@ -530,6 +555,20 @@ fn test_early_args() {
     let stdout = test_env.jj_cmd_success(test_env.env_root(), &["--color=always", "help"]);
     insta::assert_snapshot!(stdout.lines().find(|l| l.contains("Commands:")).unwrap(), @"[1m[4mCommands:[0m");
 
+    // Check that early args are accepted after the help command
+    let stdout = test_env.jj_cmd_success(test_env.env_root(), &["help", "--color=always"]);
+    insta::assert_snapshot!(stdout.lines().find(|l| l.contains("Commands:")).unwrap(), @"[1m[4mCommands:[0m");
+
+    // Check that early args are accepted after -h/--help
+    let stdout = test_env.jj_cmd_success(test_env.env_root(), &["-h", "--color=always"]);
+    insta::assert_snapshot!(
+        stdout.lines().find(|l| l.contains("Usage:")).unwrap(),
+        @"[1m[4mUsage:[0m [1mjj[0m [OPTIONS] <COMMAND>");
+    let stdout = test_env.jj_cmd_success(test_env.env_root(), &["log", "--help", "--color=always"]);
+    insta::assert_snapshot!(
+        stdout.lines().find(|l| l.contains("Usage:")).unwrap(),
+        @"[1m[4mUsage:[0m [1mjj log[0m [OPTIONS] [PATHS]...");
+
     // Early args are parsed with clap's ignore_errors(), but there is a known
     // bug that causes defaults to be unpopulated. Test that the early args are
     // tolerant of this bug and don't cause a crash.
@@ -551,6 +590,23 @@ fn test_invalid_config() {
     Config error: expected newline, found an identifier at line 1 column 10 in config/config0002.toml
     For help, see https://martinvonz.github.io/jj/latest/config/.
     "###);
+}
+
+#[test]
+fn test_invalid_config_value() {
+    // Test that we get a reasonable error if a config value is invalid
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["git", "init", "repo"]);
+    let repo_path = test_env.env_root().join("repo");
+
+    let stderr = test_env.jj_cmd_failure(
+        &repo_path,
+        &["status", "--config-toml=snapshot.auto-track=[0]"],
+    );
+    insta::assert_snapshot!(stderr, @r"
+    Config error: invalid type: sequence, expected a string for key `snapshot.auto-track`
+    For help, see https://martinvonz.github.io/jj/latest/config/.
+    ");
 }
 
 #[test]
@@ -603,15 +659,15 @@ fn test_help() {
     let test_env = TestEnvironment::default();
 
     let stdout = test_env.jj_cmd_success(test_env.env_root(), &["diffedit", "-h"]);
-    insta::assert_snapshot!(stdout, @r#"
+    insta::assert_snapshot!(stdout, @r"
     Touch up the content changes in a revision with a diff editor
 
     Usage: jj diffedit [OPTIONS]
 
     Options:
       -r, --revision <REVISION>  The revision to touch up
-          --from <FROM>          Show changes from this revision
-          --to <TO>              Edit changes in this revision
+      -f, --from <FROM>          Show changes from this revision
+      -t, --to <TO>              Edit changes in this revision
           --tool <NAME>          Specify diff editor to be used
           --restore-descendants  Preserve the content (not the diff) when rebasing descendants
       -h, --help                 Print help (see more with '--help')
@@ -626,7 +682,7 @@ fn test_help() {
           --quiet                        Silence non-primary command output
           --no-pager                     Disable the pager
           --config-toml <TOML>           Additional configuration options (can be repeated)
-    "#);
+    ");
 }
 
 #[test]

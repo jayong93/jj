@@ -25,11 +25,13 @@ alternative to the default `:builtin` diff-editor.
 
 Find it [here][hunk.nvim].
 
-## LazyJJ
+## JJ-FZF
 
-lazyjj is a lazygit inspired TUI for Jujutsu.
+Centered around the `jj log` graph view, jj-fzf provides previews of diffs, the
+evolution-log, browses the op log and offers a large number of key bindings for
+commonly used `jj` operations from rebase to undo, and helps with divergent commits.
 
-Find it [here][lazyjj].
+Find it [here][jj-fzf].
 
 ## JJ TUI
 
@@ -38,6 +40,11 @@ open to feedback.
 
 Find it [here][jj_tui].
 
+## LazyJJ
+
+lazyjj is a lazygit inspired TUI for Jujutsu.
+
+Find it [here][lazyjj].
 
 ## Visual Jujutsu
 
@@ -45,6 +52,14 @@ VJJ is a fzf (fuzzy finder) wrapper for Jujutsu, which is meant to be used
 interactively in the terminal.
 
 Find it [here][vjj].
+
+## VisualJJ
+
+VisualJJ is a plugin for Visual Studio Code which provides native integration
+for Jujutsu, not relying on Git colocation. Unlike other tools on this page,
+VisualJJ is not open-source.
+
+Find it [here][visualjj].
 
 <!-- TODO: Add benbrittains/cultivate when its ready -->
 ## Finding other integrations
@@ -56,7 +71,9 @@ You can find other community contributed tools and integrations in our
 [diffedit3]: https://github.com/ilyagr/diffedit3
 [gg]: https://github.com/gulbanana/gg
 [hunk.nvim]: https://github.com/julienvincent/hunk.nvim
+[jj-fzf]: https://github.com/tim-janik/jj-fzf
 [jj_tui]: https://github.com/faldor20/jj_tui
 [lazyjj]: https://github.com/Cretezy/lazyjj
 [vjj]: https://github.com/noahmayr/vjj
+[visualjj]: https://www.visualjj.com
 [Wiki]: https://github.com/martinvonz/jj/wiki

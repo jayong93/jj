@@ -36,7 +36,6 @@ use crate::backend::TreeId;
 use crate::backend::TreeValue;
 use crate::content_hash::ContentHash;
 use crate::content_hash::DigestUpdate;
-use crate::object_id::ObjectId;
 use crate::repo_path::RepoPath;
 use crate::store::Store;
 use crate::tree::Tree;
@@ -340,6 +339,13 @@ impl<T> Merge<T> {
         self.values.resize(num_sides * 2 - 1, value.clone());
     }
 
+    /// Returns a slice containing the terms. The items will alternate between
+    /// positive and negative terms, starting with positive (since there's one
+    /// more of those).
+    pub fn as_slice(&self) -> &[T] {
+        &self.values
+    }
+
     /// Returns an iterator over references to the terms. The items will
     /// alternate between positive and negative terms, starting with
     /// positive (since there's one more of those).
@@ -424,7 +430,7 @@ impl<T> FromIterator<T> for MergeBuilder<T> {
 
 impl<T> Extend<T> for MergeBuilder<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.values.extend(iter)
+        self.values.extend(iter);
     }
 }
 
@@ -512,17 +518,19 @@ impl<T> Merge<Merge<T>> {
 
 impl<T: ContentHash> ContentHash for Merge<T> {
     fn hash(&self, state: &mut impl DigestUpdate) {
-        self.values.hash(state)
+        self.values.hash(state);
     }
 }
 
 /// Borrowed `MergedTreeValue`.
 pub type MergedTreeVal<'a> = Merge<Option<&'a TreeValue>>;
 
-/// The value at a given path in a commit. It depends on the context whether it
-/// can be absent (`Merge::is_absent()`). For example, when getting the value at
-/// a specific path, it may be, but when iterating over entries in a tree, it
-/// shouldn't be.
+/// The value at a given path in a commit.
+///
+/// It depends on the context whether it can be absent
+/// (`Merge::is_absent()`). For example, when getting the value at a
+/// specific path, it may be, but when iterating over entries in a
+/// tree, it shouldn't be.
 pub type MergedTreeValue = Merge<Option<TreeValue>>;
 
 impl MergedTreeValue {
@@ -605,7 +613,7 @@ where
         if let Some(tree_id_merge) = tree_id_merge {
             let get_tree = |id: &Option<&TreeId>| -> BackendResult<Tree> {
                 if let Some(id) = id {
-                    store.get_tree(dir, id)
+                    store.get_tree(dir.to_owned(), id)
                 } else {
                     Ok(Tree::empty(store.clone(), dir.to_owned()))
                 }
@@ -663,25 +671,25 @@ fn describe_conflict_term(value: &TreeValue) -> String {
             id,
             executable: false,
         } => {
-            format!("file with id {}", id.hex())
+            format!("file with id {id}")
         }
         TreeValue::File {
             id,
             executable: true,
         } => {
-            format!("executable file with id {}", id.hex())
+            format!("executable file with id {id}")
         }
         TreeValue::Symlink(id) => {
-            format!("symlink with id {}", id.hex())
+            format!("symlink with id {id}")
         }
         TreeValue::Tree(id) => {
-            format!("tree with id {}", id.hex())
+            format!("tree with id {id}")
         }
         TreeValue::GitSubmodule(id) => {
-            format!("Git submodule with id {}", id.hex())
+            format!("Git submodule with id {id}")
         }
         TreeValue::Conflict(id) => {
-            format!("Conflict with id {}", id.hex())
+            format!("Conflict with id {id}")
         }
     }
 }

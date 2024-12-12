@@ -13,11 +13,11 @@
 // limitations under the License.
 
 mod abandon;
+mod absorb;
 mod backout;
 #[cfg(feature = "bench")]
 mod bench;
 mod bookmark;
-mod checkout;
 mod commit;
 mod config;
 mod debug;
@@ -30,11 +30,10 @@ mod evolog;
 mod file;
 mod fix;
 mod git;
+mod help;
 mod init;
 mod interdiff;
 mod log;
-mod merge;
-mod r#move;
 mod new;
 mod next;
 mod operation;
@@ -46,6 +45,7 @@ mod restore;
 mod root;
 mod run;
 mod show;
+mod simplify_parents;
 mod sparse;
 mod split;
 mod squash;
@@ -61,17 +61,23 @@ use std::fmt::Debug;
 use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::Subcommand;
+use clap_complete::engine::SubcommandCandidates;
 use tracing::instrument;
 
 use crate::cli_util::Args;
 use crate::cli_util::CommandHelper;
 use crate::command_error::user_error_with_hint;
 use crate::command_error::CommandError;
+use crate::complete;
 use crate::ui::Ui;
 
 #[derive(clap::Parser, Clone, Debug)]
+#[command(disable_help_subcommand = true)]
+#[command(after_long_help = help::show_keyword_hint_after_help())]
+#[command(add = SubcommandCandidates::new(complete::aliases))]
 enum Command {
     Abandon(abandon::AbandonArgs),
+    Absorb(absorb::AbsorbArgs),
     Backout(backout::BackoutArgs),
     #[cfg(feature = "bench")]
     #[command(subcommand)]
@@ -83,8 +89,6 @@ enum Command {
     Branch(bookmark::BookmarkCommand),
     #[command(alias = "print", hide = true)]
     Cat(file::show::FileShowArgs),
-    #[command(hide = true)]
-    Checkout(checkout::CheckoutArgs),
     // TODO: Delete `chmod` in jj 0.25+
     #[command(hide = true)]
     Chmod(file::chmod::FileChmodArgs),
@@ -109,22 +113,10 @@ enum Command {
     Fix(fix::FixArgs),
     #[command(subcommand)]
     Git(git::GitCommand),
+    Help(help::HelpArgs),
     Init(init::InitArgs),
     Interdiff(interdiff::InterdiffArgs),
     Log(log::LogArgs),
-    /// Merge work from multiple bookmarks (DEPRECATED, use `jj new`)
-    ///
-    /// Unlike most other VCSs, `jj merge` does not implicitly include the
-    /// working copy revision's parent as one of the parents of the merge;
-    /// you need to explicitly list all revisions that should become parents
-    /// of the merge.
-    ///
-    /// This is the same as `jj new`, except that it requires at least two
-    /// arguments.
-    #[command(hide = true)]
-    Merge(new::NewArgs),
-    #[command(hide = true)]
-    Move(r#move::MoveArgs),
     New(new::NewArgs),
     Next(next::NextArgs),
     #[command(subcommand)]
@@ -145,6 +137,7 @@ enum Command {
     // TODO: Flesh out.
     Run(run::RunArgs),
     Show(show::ShowArgs),
+    SimplifyParents(simplify_parents::SimplifyParentsArgs),
     #[command(subcommand)]
     Sparse(sparse::SparseCommand),
     Split(split::SplitArgs),
@@ -183,6 +176,7 @@ pub fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<(), Co
     let subcommand = Command::from_arg_matches(command_helper.matches()).unwrap();
     match &subcommand {
         Command::Abandon(args) => abandon::cmd_abandon(ui, command_helper, args),
+        Command::Absorb(args) => absorb::cmd_absorb(ui, command_helper, args),
         Command::Backout(args) => backout::cmd_backout(ui, command_helper, args),
         #[cfg(feature = "bench")]
         Command::Bench(args) => bench::cmd_bench(ui, command_helper, args),
@@ -195,7 +189,6 @@ pub fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<(), Co
             let cmd = renamed_cmd("cat", "file show", file::show::cmd_file_show);
             cmd(ui, command_helper, args)
         }
-        Command::Checkout(args) => checkout::cmd_checkout(ui, command_helper, args),
         Command::Chmod(args) => {
             let cmd = renamed_cmd("chmod", "file chmod", file::chmod::cmd_file_chmod);
             cmd(ui, command_helper, args)
@@ -215,11 +208,10 @@ pub fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<(), Co
         }
         Command::Fix(args) => fix::cmd_fix(ui, command_helper, args),
         Command::Git(args) => git::cmd_git(ui, command_helper, args),
+        Command::Help(args) => help::cmd_help(ui, command_helper, args),
         Command::Init(args) => init::cmd_init(ui, command_helper, args),
         Command::Interdiff(args) => interdiff::cmd_interdiff(ui, command_helper, args),
         Command::Log(args) => log::cmd_log(ui, command_helper, args),
-        Command::Merge(args) => merge::cmd_merge(ui, command_helper, args),
-        Command::Move(args) => r#move::cmd_move(ui, command_helper, args),
         Command::New(args) => new::cmd_new(ui, command_helper, args),
         Command::Next(args) => next::cmd_next(ui, command_helper, args),
         Command::Evolog(args) => evolog::cmd_evolog(ui, command_helper, args),
@@ -232,6 +224,9 @@ pub fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<(), Co
         Command::Revert(_args) => revert(),
         Command::Root(args) => root::cmd_root(ui, command_helper, args),
         Command::Run(args) => run::cmd_run(ui, command_helper, args),
+        Command::SimplifyParents(args) => {
+            simplify_parents::cmd_simplify_parents(ui, command_helper, args)
+        }
         Command::Show(args) => show::cmd_show(ui, command_helper, args),
         Command::Sparse(args) => sparse::cmd_sparse(ui, command_helper, args),
         Command::Split(args) => split::cmd_split(ui, command_helper, args),

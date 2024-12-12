@@ -17,6 +17,7 @@ use std::io;
 use std::io::Write;
 
 use itertools::Itertools;
+use jj_lib::config::ConfigError;
 use jj_lib::settings::UserSettings;
 use renderdag::Ancestor;
 use renderdag::GraphRowRenderer;
@@ -57,7 +58,7 @@ impl<K: Clone> From<&Edge<K>> for Ancestor<K> {
     }
 }
 
-impl<'writer, K, R> GraphLog<K> for SaplingGraphLog<'writer, R>
+impl<K, R> GraphLog<K> for SaplingGraphLog<'_, R>
 where
     K: Clone + Eq + Hash,
     R: Renderer<K, Output = String>,
@@ -112,8 +113,8 @@ pub enum GraphStyle {
 }
 
 impl GraphStyle {
-    pub fn from_settings(settings: &UserSettings) -> Result<Self, config::ConfigError> {
-        settings.config().get("ui.graph.style")
+    pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigError> {
+        settings.get("ui.graph.style")
     }
 
     pub fn is_ascii(self) -> bool {

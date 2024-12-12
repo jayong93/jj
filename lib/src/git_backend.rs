@@ -430,7 +430,7 @@ impl GitBackend {
         );
         let filter = gix::diff::blob::Pipeline::new(
             Default::default(),
-            gix_filter::Pipeline::new(
+            gix::filter::plumbing::Pipeline::new(
                 self.git_repo()
                     .command_context()
                     .map_err(|err| BackendError::Other(Box::new(err)))?,
@@ -519,6 +519,7 @@ fn commit_from_git_without_root_parent(
     id: &CommitId,
     git_object: &gix::Object,
     uses_tree_conflict_format: bool,
+    is_shallow: bool,
 ) -> BackendResult<Commit> {
     let commit = git_object
         .try_to_commit_ref()
@@ -537,10 +538,17 @@ fn commit_from_git_without_root_parent(
             .map(|b| b.reverse_bits())
             .collect(),
     );
-    let parents = commit
-        .parents()
-        .map(|oid| CommitId::from_bytes(oid.as_bytes()))
-        .collect_vec();
+    // shallow commits don't have parents their parents actually fetched, so we
+    // discard them here
+    // TODO: This causes issues when a shallow repository is deepened/unshallowed
+    let parents = if is_shallow {
+        vec![]
+    } else {
+        commit
+            .parents()
+            .map(|oid| CommitId::from_bytes(oid.as_bytes()))
+            .collect_vec()
+    };
     let tree_id = TreeId::from_bytes(commit.tree().as_bytes());
     // If this commit is a conflict, we'll update the root tree later, when we read
     // the extra metadata.
@@ -695,7 +703,7 @@ fn deserialize_extras(commit: &mut Commit, bytes: &[u8]) {
 /// Returns `RefEdit` that will create a ref in `refs/jj/keep` if not exist.
 /// Used for preventing GC of commits we create.
 fn to_no_gc_ref_update(id: &CommitId) -> gix::refs::transaction::RefEdit {
-    let name = format!("{NO_GC_REF_NAMESPACE}{}", id.hex());
+    let name = format!("{NO_GC_REF_NAMESPACE}{id}");
     let new = gix::refs::Target::Object(validate_git_object_id(id).unwrap());
     let expected = gix::refs::transaction::PreviousValue::ExistingMustMatch(new.clone());
     gix::refs::transaction::RefEdit {
@@ -859,6 +867,10 @@ fn import_extra_metadata_entries_from_heads(
     head_ids: &HashSet<&CommitId>,
     uses_tree_conflict_format: bool,
 ) -> BackendResult<()> {
+    let shallow_commits = git_repo
+        .shallow_commits()
+        .map_err(|e| BackendError::Other(Box::new(e)))?;
+
     let mut work_ids = head_ids
         .iter()
         .filter(|&id| mut_table.get_value(id.as_bytes()).is_none())
@@ -868,11 +880,18 @@ fn import_extra_metadata_entries_from_heads(
         let git_object = git_repo
             .find_object(validate_git_object_id(&id)?)
             .map_err(|err| map_not_found_err(err, &id))?;
+        let is_shallow = shallow_commits
+            .as_ref()
+            .is_some_and(|shallow| shallow.contains(&git_object.id));
         // TODO(#1624): Should we read the root tree here and check if it has a
         // `.jjconflict-...` entries? That could happen if the user used `git` to e.g.
         // change the description of a commit with tree-level conflicts.
-        let commit =
-            commit_from_git_without_root_parent(&id, &git_object, uses_tree_conflict_format)?;
+        let commit = commit_from_git_without_root_parent(
+            &id,
+            &git_object,
+            uses_tree_conflict_format,
+            is_shallow,
+        )?;
         mut_table.add_entry(id.to_bytes(), serialize_extras(&commit));
         work_ids.extend(
             commit
@@ -956,8 +975,7 @@ impl Backend for GitBackend {
             .try_into_blob()
             .map_err(|err| to_read_object_err(err, id))?;
         let target = String::from_utf8(blob.take_data())
-            .map_err(|err| to_invalid_utf8_err(err.utf8_error(), id))?
-            .to_owned();
+            .map_err(|err| to_invalid_utf8_err(err.utf8_error(), id))?;
         Ok(target)
     }
 
@@ -1042,7 +1060,7 @@ impl Backend for GitBackend {
         let entries = contents
             .entries()
             .map(|entry| {
-                let name = entry.name().as_str();
+                let name = entry.name().as_internal_str();
                 match entry.value() {
                     TreeValue::File {
                         id,
@@ -1142,7 +1160,12 @@ impl Backend for GitBackend {
             let git_object = locked_repo
                 .find_object(git_commit_id)
                 .map_err(|err| map_not_found_err(err, id))?;
-            commit_from_git_without_root_parent(id, &git_object, false)?
+            let is_shallow = locked_repo
+                .shallow_commits()
+                .ok()
+                .flatten()
+                .is_some_and(|shallow| shallow.contains(&git_object.id));
+            commit_from_git_without_root_parent(id, &git_object, false, is_shallow)?
         };
         if commit.parents.is_empty() {
             commit.parents.push(self.root_commit_id.clone());
@@ -1296,14 +1319,10 @@ impl Backend for GitBackend {
 
         let change_to_copy_record =
             |change: gix::object::tree::diff::Change| -> BackendResult<Option<CopyRecord>> {
-                let gix::object::tree::diff::Change {
+                let gix::object::tree::diff::Change::Rewrite {
+                    source_location,
+                    source_id,
                     location: dest_location,
-                    event:
-                        gix::object::tree::diff::change::Event::Rewrite {
-                            source_location,
-                            source_id,
-                            ..
-                        },
                     ..
                 } = change
                 else {
@@ -1330,19 +1349,19 @@ impl Backend for GitBackend {
             };
 
         let mut records: Vec<BackendResult<CopyRecord>> = Vec::new();
-        let mut change_platform = root_tree
+        root_tree
             .changes()
-            .map_err(|err| BackendError::Other(err.into()))?;
-        change_platform.track_path();
-        change_platform.track_rewrites(Some(gix::diff::Rewrites {
-            copies: Some(gix::diff::rewrites::Copies {
-                source: gix::diff::rewrites::CopySource::FromSetOfModifiedFiles,
-                percentage: Some(0.5),
-            }),
-            percentage: Some(0.5),
-            limit: 1000,
-        }));
-        change_platform
+            .map_err(|err| BackendError::Other(err.into()))?
+            .options(|opts| {
+                opts.track_path().track_rewrites(Some(gix::diff::Rewrites {
+                    copies: Some(gix::diff::rewrites::Copies {
+                        source: gix::diff::rewrites::CopySource::FromSetOfModifiedFiles,
+                        percentage: Some(0.5),
+                    }),
+                    percentage: Some(0.5),
+                    limit: 1000,
+                }));
+            })
             .for_each_to_obtain_tree_with_cache(
                 &head_tree,
                 &mut self.new_diff_platform()?,
@@ -1517,6 +1536,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::config::StackedConfig;
     use crate::content_hash::blake2b_hash;
 
     #[test_case(false; "legacy tree format")]
@@ -1637,7 +1657,7 @@ mod tests {
         let mut root_entries = root_tree.entries();
         let dir = root_entries.next().unwrap();
         assert_eq!(root_entries.next(), None);
-        assert_eq!(dir.name().as_str(), "dir");
+        assert_eq!(dir.name().as_internal_str(), "dir");
         assert_eq!(
             dir.value(),
             &TreeValue::Tree(TreeId::from_bytes(dir_tree_id.as_bytes()))
@@ -1654,7 +1674,7 @@ mod tests {
         let file = entries.next().unwrap();
         let symlink = entries.next().unwrap();
         assert_eq!(entries.next(), None);
-        assert_eq!(file.name().as_str(), "normal");
+        assert_eq!(file.name().as_internal_str(), "normal");
         assert_eq!(
             file.value(),
             &TreeValue::File {
@@ -1662,7 +1682,7 @@ mod tests {
                 executable: false
             }
         );
-        assert_eq!(symlink.name().as_str(), "symlink");
+        assert_eq!(symlink.name().as_internal_str(), "symlink");
         assert_eq!(
             symlink.value(),
             &TreeValue::Symlink(SymlinkId::from_bytes(blob2.as_bytes()))
@@ -1747,10 +1767,11 @@ mod tests {
         // libgit2-rs works with &strs here for some reason
         let commit_buf = std::str::from_utf8(&commit_buf).unwrap();
         let secure_sig =
-            "here are some ASCII bytes to be used as a test signature\n\ndefinitely not PGP";
+            "here are some ASCII bytes to be used as a test signature\n\ndefinitely not PGP\n";
 
+        // git2 appears to append newline unconditionally
         let git_commit_id = git_repo
-            .commit_signed(commit_buf, secure_sig, None)
+            .commit_signed(commit_buf, secure_sig.trim_end_matches('\n'), None)
             .unwrap();
 
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path()).unwrap();
@@ -2134,7 +2155,7 @@ mod tests {
 
         let mut signer = |data: &_| {
             let hash: String = blake2b_hash(data).encode_hex();
-            Ok(format!("test sig\n\n\nhash={hash}").into_bytes())
+            Ok(format!("test sig\n\n\nhash={hash}\n").into_bytes())
         };
 
         let (id, commit) = backend
@@ -2200,7 +2221,7 @@ mod tests {
     // UserSettings type. testutils returns jj_lib (2)'s UserSettings, whereas
     // our UserSettings type comes from jj_lib (1).
     fn user_settings() -> UserSettings {
-        let config = config::Config::default();
+        let config = StackedConfig::empty();
         UserSettings::from_config(config)
     }
 }

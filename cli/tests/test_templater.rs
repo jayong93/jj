@@ -25,15 +25,15 @@ fn test_templater_parse_error() {
     let repo_path = test_env.env_root().join("repo");
     let render_err = |template| test_env.jj_cmd_failure(&repo_path, &["log", "-T", template]);
 
-    insta::assert_snapshot!(render_err(r#"description ()"#), @r###"
+    insta::assert_snapshot!(render_err(r#"description ()"#), @r"
     Error: Failed to parse template: Syntax error
     Caused by:  --> 1:13
       |
     1 | description ()
       |             ^---
       |
-      = expected <EOI>, `++`, `||`, or `&&`
-    "###);
+      = expected <EOI>, `++`, `||`, `&&`, `==`, or `!=`
+    ");
 
     // Typo
     test_env.add_config(
@@ -113,7 +113,7 @@ fn test_templater_parse_error() {
       | ^-----^
       |
       = Keyword "builtin" doesn't exist
-    Hint: Did you mean "builtin_log_comfortable", "builtin_log_compact", "builtin_log_detailed", "builtin_log_node", "builtin_log_node_ascii", "builtin_log_oneline", "builtin_op_log_comfortable", "builtin_op_log_compact", "builtin_op_log_node", "builtin_op_log_node_ascii"?
+    Hint: Did you mean "builtin_log_comfortable", "builtin_log_compact", "builtin_log_compact_full_description", "builtin_log_detailed", "builtin_log_node", "builtin_log_node_ascii", "builtin_log_oneline", "builtin_op_log_comfortable", "builtin_op_log_compact", "builtin_op_log_node", "builtin_op_log_node_ascii"?
     "#);
 }
 

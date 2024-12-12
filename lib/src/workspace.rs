@@ -33,6 +33,7 @@ use crate::file_util::PathError;
 use crate::local_backend::LocalBackend;
 use crate::local_working_copy::LocalWorkingCopy;
 use crate::local_working_copy::LocalWorkingCopyFactory;
+use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store::OperationId;
 use crate::op_store::WorkspaceId;
 use crate::repo::read_store_type;
@@ -53,6 +54,7 @@ use crate::signing::SignInitError;
 use crate::signing::Signer;
 use crate::store::Store;
 use crate::working_copy::CheckoutError;
+use crate::working_copy::CheckoutOptions;
 use crate::working_copy::CheckoutStats;
 use crate::working_copy::LockedWorkingCopy;
 use crate::working_copy::WorkingCopy;
@@ -71,6 +73,8 @@ pub enum WorkspaceInitError {
     WorkingCopyState(#[from] WorkingCopyStateError),
     #[error(transparent)]
     Path(#[from] PathError),
+    #[error(transparent)]
+    OpHeadsStore(#[from] OpHeadsStoreError),
     #[error(transparent)]
     Backend(#[from] BackendInitError),
     #[error(transparent)]
@@ -93,6 +97,8 @@ pub enum WorkspaceLoadError {
     Path(#[from] PathError),
 }
 
+/// The combination of a repo and a working copy.
+///
 /// Represents the combination of a repo and working copy, i.e. what's typically
 /// the .jj/ directory and its parent. See
 /// <https://github.com/martinvonz/jj/blob/main/docs/working-copy.md#workspaces>
@@ -134,7 +140,7 @@ fn init_working_copy(
         user_settings,
         &repo.store().root_commit(),
     )?;
-    let repo = tx.commit(format!("add workspace '{}'", workspace_id.as_str()));
+    let repo = tx.commit(format!("add workspace '{}'", workspace_id.as_str()))?;
 
     let working_copy = working_copy_factory.init_working_copy(
         repo.store().clone(),
@@ -303,6 +309,7 @@ impl Workspace {
             )
             .map_err(|repo_init_err| match repo_init_err {
                 RepoInitError::Backend(err) => WorkspaceInitError::Backend(err),
+                RepoInitError::OpHeadsStore(err) => WorkspaceInitError::OpHeadsStore(err),
                 RepoInitError::Path(err) => WorkspaceInitError::Path(err),
             })?;
             let (working_copy, repo) = init_working_copy(
@@ -313,7 +320,7 @@ impl Workspace {
                 working_copy_factory,
                 workspace_id,
             )?;
-            let repo_loader = repo.loader();
+            let repo_loader = repo.loader().clone();
             let workspace = Workspace::new(workspace_root, repo_dir, working_copy, repo_loader)?;
             Ok((workspace, repo))
         })()
@@ -372,7 +379,12 @@ impl Workspace {
             working_copy_factory,
             workspace_id,
         )?;
-        let workspace = Workspace::new(workspace_root, repo_dir, working_copy, repo.loader())?;
+        let workspace = Workspace::new(
+            workspace_root,
+            repo_dir,
+            working_copy,
+            repo.loader().clone(),
+        )?;
         Ok((workspace, repo))
     }
 
@@ -422,6 +434,7 @@ impl Workspace {
         operation_id: OperationId,
         old_tree_id: Option<&MergedTreeId>,
         commit: &Commit,
+        options: &CheckoutOptions,
     ) -> Result<CheckoutStats, CheckoutError> {
         let mut locked_ws =
             self.start_working_copy_mutation()
@@ -438,7 +451,7 @@ impl Workspace {
                 return Err(CheckoutError::ConcurrentCheckout);
             }
         }
-        let stats = locked_ws.locked_wc().check_out(commit)?;
+        let stats = locked_ws.locked_wc().check_out(commit, options)?;
         locked_ws
             .finish(operation_id)
             .map_err(|err| CheckoutError::Other {
@@ -454,7 +467,7 @@ pub struct LockedWorkspace<'a> {
     locked_wc: Box<dyn LockedWorkingCopy>,
 }
 
-impl<'a> LockedWorkspace<'a> {
+impl LockedWorkspace<'_> {
     pub fn locked_wc(&mut self) -> &mut dyn LockedWorkingCopy {
         self.locked_wc.as_mut()
     }
@@ -609,8 +622,8 @@ impl WorkspaceLoader for DefaultWorkspaceLoader {
     ) -> Result<Box<dyn WorkingCopy>, WorkspaceLoadError> {
         Ok(working_copy_factory.load_working_copy(
             store.clone(),
-            self.workspace_root.to_owned(),
-            self.working_copy_state_path.to_owned(),
+            self.workspace_root.clone(),
+            self.working_copy_state_path.clone(),
         )?)
     }
 }

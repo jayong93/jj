@@ -22,6 +22,7 @@ use crate::backend::Timestamp;
 use crate::dag_walk;
 use crate::index::ReadonlyIndex;
 use crate::op_heads_store::OpHeadsStore;
+use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store;
 use crate::op_store::OperationMetadata;
 use crate::operation::Operation;
@@ -102,7 +103,10 @@ impl Transaction {
     }
 
     /// Writes the transaction to the operation store and publishes it.
-    pub fn commit(self, description: impl Into<String>) -> Arc<ReadonlyRepo> {
+    pub fn commit(
+        self,
+        description: impl Into<String>,
+    ) -> Result<Arc<ReadonlyRepo>, OpHeadsStoreError> {
         self.write(description).publish()
     }
 
@@ -138,7 +142,7 @@ impl Transaction {
             .index_store()
             .write_index(mut_index, &operation)
             .unwrap();
-        UnpublishedOperation::new(&base_repo.loader(), operation, view, index)
+        UnpublishedOperation::new(base_repo.loader(), operation, view, index)
     }
 }
 
@@ -164,6 +168,8 @@ pub fn create_op_metadata(
     }
 }
 
+/// An unpublished operation in the store.
+///
 /// An Operation which has been written to the operation store but not
 /// published. The repo can be loaded at an unpublished Operation, but the
 /// Operation will not be visible in the op log if the repo is loaded at head.
@@ -193,11 +199,11 @@ impl UnpublishedOperation {
         self.repo.operation()
     }
 
-    pub fn publish(self) -> Arc<ReadonlyRepo> {
-        let _lock = self.op_heads_store.lock();
+    pub fn publish(self) -> Result<Arc<ReadonlyRepo>, OpHeadsStoreError> {
+        let _lock = self.op_heads_store.lock()?;
         self.op_heads_store
-            .update_op_heads(self.operation().parent_ids(), self.operation().id());
-        self.repo
+            .update_op_heads(self.operation().parent_ids(), self.operation().id())?;
+        Ok(self.repo)
     }
 
     pub fn leave_unpublished(self) -> Arc<ReadonlyRepo> {

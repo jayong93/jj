@@ -2,11 +2,11 @@
 
 ## Anonymous branch
 
-An anonymous branch is a chain of commits that doesn't have any
-[named bookmarks](#bookmark) pointing to it or to any of its descendants. Unlike
-Git, Jujutsu keeps commits on anonymous branches around until they are
-explicitly abandoned. Visible anonymous branches are tracked by the
-[view](#view), which stores a list of [heads](#head) of such branches.
+An anonymous branch is a chain of commits that doesn't necessarily have any
+[bookmarks](#bookmark) pointing to it or to any of its descendants. Unlike Git,
+Jujutsu keeps commits on anonymous branches around until they are explicitly
+abandoned. Visible anonymous branches are tracked by the [view](#view), which
+stores a list of [heads](#head) of such branches.
 
 ## Backend
 
@@ -22,16 +22,31 @@ such as the "operation store backend" for storing
 
 ## Bookmark
 
-A bookmark is a named pointer to a [commit](#commit). They automatically follow
-the commit if it gets [rewritten](#rewrite). Bookmarks are sometimes called
-"named branches" to distinguish them from [anonymous branches](#anonymous-branch).
-They are similar to Git's branches and even more similar to
-[Mercurial's bookmarks](https://wiki.mercurial-scm.org/Bookmarks). See
-[here](bookmarks.md) for details.
+A bookmark is a named pointer to a [commit](#commit). They are similar to Git's
+[branches](#branch) and even more similar to [Mercurial's
+bookmarks](https://wiki.mercurial-scm.org/Bookmarks). See [here](bookmarks.md)
+for details.
+
+Unlike in Git, there is no concept of a "current bookmark"; bookmarks *do not*
+move when you create a new commit. Bookmarks *do* automatically follow the
+commit if it gets [rewritten](#rewrite).
+
+## Branch
+
+In the context of `jj`, the work "branch" usually refers to an [anonymous
+branch](#anonymous-branch) or, less formally, a branch of the commit "tree"
+(which is itself an informal way to refer to the commit graph, parts of which
+might resemble a tree even when it's not mathematically a tree).
+
+We also sometimes discuss Git's branches and branches on Git remotes. Locally,
+these correspond to [bookmarks](#bookmark). In a co-located repository, each
+local Git branch corresponds to a `jj` bookmark.
 
 ## Change
 
-A change is a commit as it [evolves over time](#rewrite).
+A change is a commit as it [evolves over time](#rewrite). Changes themselves
+don't exist as an object in the data model; only the change ID does. The change
+ID is a property of a commit.
 
 ## Change ID
 
@@ -40,7 +55,7 @@ A change ID is a unique identifier for a [change](#change). They are typically
 them as a sequence of 12 letters in the k-z range, at the beginning of a line.
 These are actually hexadecimal numbers that use "digits" z-k instead of 0-9a-f.
 
-For the git backend, Change IDs are currently maintained only locally and not
+For the Git backend, Change IDs are currently maintained only locally and not
 exchanged via push/fetch operations.
 
 ## Commit

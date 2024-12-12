@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::iter;
 use std::path::Path;
 use std::path::PathBuf;
@@ -65,7 +66,6 @@ use tempfile::TempDir;
 use test_case::test_case;
 use testutils::commit_transactions;
 use testutils::create_random_commit;
-use testutils::load_repo_at_head;
 use testutils::write_random_commit;
 use testutils::TestRepo;
 use testutils::TestRepoBackend;
@@ -138,7 +138,7 @@ fn test_import_refs() {
     git::import_head(tx.repo_mut()).unwrap();
     let stats = git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
 
     assert!(stats.abandoned_commits.is_empty());
@@ -260,7 +260,7 @@ fn test_import_refs_reimport() {
     let mut tx = repo.start_transaction(&settings);
     let stats = git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     assert!(stats.abandoned_commits.is_empty());
     let expected_heads = hashset! {
@@ -283,12 +283,12 @@ fn test_import_refs_reimport() {
         .unwrap();
     tx.repo_mut()
         .set_local_bookmark_target("feature2", RefTarget::normal(commit6.id().clone()));
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     let mut tx = repo.start_transaction(&settings);
     let stats = git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     assert_eq!(
         // The order is unstable just because we import heads from Git repo.
@@ -519,7 +519,7 @@ fn test_import_refs_reimport_with_deleted_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     let expected_heads = hashset! {
             jj_id(&commit_main),
@@ -575,7 +575,7 @@ fn test_import_refs_reimport_with_deleted_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     let view = repo.view();
     // The local bookmarks were indeed deleted
@@ -641,7 +641,7 @@ fn test_import_refs_reimport_with_moved_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     let expected_heads = hashset! {
             jj_id(&commit_main),
@@ -707,7 +707,7 @@ fn test_import_refs_reimport_with_moved_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     let view = repo.view();
     assert_eq!(view.bookmarks().count(), 3);
@@ -774,7 +774,7 @@ fn test_import_refs_reimport_with_moved_untracked_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
 
     assert_eq!(*view.heads(), hashset! { jj_id(&commit_remote_t0) });
@@ -794,7 +794,7 @@ fn test_import_refs_reimport_with_moved_untracked_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
 
     // commit_remote_t0 should be abandoned, but commit_base shouldn't because
@@ -832,7 +832,7 @@ fn test_import_refs_reimport_with_deleted_untracked_intermediate_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
 
     assert_eq!(*view.heads(), hashset! { jj_id(&commit_remote_b) });
@@ -858,7 +858,7 @@ fn test_import_refs_reimport_with_deleted_untracked_intermediate_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
 
     // No commits should be abandoned because feature-a is pinned by feature-b.
@@ -897,7 +897,7 @@ fn test_import_refs_reimport_with_deleted_abandoned_untracked_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
 
     assert_eq!(*view.heads(), hashset! { jj_id(&commit_remote_b) });
@@ -925,7 +925,7 @@ fn test_import_refs_reimport_with_deleted_abandoned_untracked_remote_ref() {
     tx.repo_mut()
         .record_abandoned_commit(jj_id(&commit_remote_b));
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
     assert_eq!(*view.heads(), hashset! { jj_id(&commit_remote_a) });
     assert_eq!(view.local_bookmarks().count(), 0);
@@ -936,7 +936,7 @@ fn test_import_refs_reimport_with_deleted_abandoned_untracked_remote_ref() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let view = repo.view();
 
     // The feature-a commit should be abandoned. Since feature-b has already
@@ -1089,7 +1089,7 @@ fn test_import_refs_reimport_conflicted_remote_bookmark() {
     // The conflict can be resolved by importing the current Git state
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     assert_eq!(
         repo.view().get_git_ref("refs/remotes/origin/main"),
         &RefTarget::normal(jj_id(&commit2)),
@@ -1157,7 +1157,7 @@ fn test_import_some_refs() {
     })
     .unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     // There are two heads, feature2 and feature4.
     let view = repo.view();
@@ -1238,7 +1238,7 @@ fn test_import_some_refs() {
     })
     .unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     // feature2 and feature4 will still be heads, and all four bookmarks should be
     // present.
@@ -1255,7 +1255,7 @@ fn test_import_some_refs() {
     .unwrap();
     // No descendant should be rewritten.
     assert_eq!(tx.repo_mut().rebase_descendants(&settings).unwrap(), 0);
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     // feature2 and feature4 should still be the heads, and all three bookmarks
     // feature2, feature3, and feature3 should exist.
@@ -1272,7 +1272,7 @@ fn test_import_some_refs() {
     .unwrap();
     // No descendant should be rewritten
     assert_eq!(tx.repo_mut().rebase_descendants(&settings).unwrap(), 0);
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     // feature2 and feature4 should still be the heads, and both bookmarks
     // should exist.
@@ -1288,7 +1288,7 @@ fn test_import_some_refs() {
     .unwrap();
     // No descendant should be rewritten
     assert_eq!(tx.repo_mut().rebase_descendants(&settings).unwrap(), 0);
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     // feature2 should now be the only head and only bookmark.
     let view = repo.view();
@@ -1363,7 +1363,7 @@ fn test_import_refs_empty_git_repo() {
     tx.repo_mut()
         .rebase_descendants(&test_data.settings)
         .unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     assert_eq!(*repo.view().heads(), heads_before);
     assert_eq!(repo.view().bookmarks().count(), 0);
     assert_eq!(repo.view().tags().len(), 0);
@@ -1466,7 +1466,7 @@ fn test_import_refs_detached_head() {
     tx.repo_mut()
         .rebase_descendants(&test_data.settings)
         .unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     let expected_heads = hashset! { jj_id(&commit1) };
     assert_eq!(*repo.view().heads(), expected_heads);
@@ -2216,7 +2216,7 @@ fn test_reset_head_with_index() {
     git_repo
         .index()
         .unwrap()
-        .add_path(&file_path.to_fs_path(Path::new("")))
+        .add_path(&file_path.to_fs_path_unchecked(Path::new("")))
         .unwrap();
     assert!(!git_repo.index().unwrap().is_empty());
 
@@ -2269,6 +2269,7 @@ fn test_fetch_empty_repo() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
     // No default bookmark and no refs
@@ -2279,7 +2280,7 @@ fn test_fetch_empty_repo() {
 }
 
 #[test]
-fn test_fetch_initial_commit() {
+fn test_fetch_initial_commit_head_is_not_set() {
     let test_data = GitRepoData::create();
     let git_settings = GitSettings {
         auto_local_bookmark: true,
@@ -2295,12 +2296,13 @@ fn test_fetch_initial_commit() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
     // No default bookmark because the origin repo's HEAD wasn't set
     assert_eq!(stats.default_branch, None);
     assert!(stats.import_stats.abandoned_commits.is_empty());
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     // The initial commit is visible after git::fetch().
     let view = repo.view();
     assert!(view.heads().contains(&jj_id(&initial_git_commit)));
@@ -2329,6 +2331,41 @@ fn test_fetch_initial_commit() {
 }
 
 #[test]
+fn test_fetch_initial_commit_head_is_set() {
+    let test_data = GitRepoData::create();
+    let git_settings = GitSettings {
+        auto_local_bookmark: true,
+        ..Default::default()
+    };
+    let initial_git_commit = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
+    test_data.origin_repo.set_head("refs/heads/main").unwrap();
+    let new_git_commit = empty_git_commit(
+        &test_data.origin_repo,
+        "refs/heads/main",
+        &[&initial_git_commit],
+    );
+    test_data
+        .origin_repo
+        .reference("refs/tags/v1.0", new_git_commit.id(), false, "")
+        .unwrap();
+
+    let mut tx = test_data.repo.start_transaction(&test_data.settings);
+    let stats = git::fetch(
+        tx.repo_mut(),
+        &test_data.git_repo,
+        "origin",
+        &[StringPattern::everything()],
+        git::RemoteCallbacks::default(),
+        &git_settings,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(stats.default_branch, Some("main".to_string()));
+    assert!(stats.import_stats.abandoned_commits.is_empty());
+}
+
+#[test]
 fn test_fetch_success() {
     let mut test_data = GitRepoData::create();
     let git_settings = GitSettings {
@@ -2345,9 +2382,10 @@ fn test_fetch_success() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
-    test_data.repo = tx.commit("test");
+    test_data.repo = tx.commit("test").unwrap();
 
     test_data.origin_repo.set_head("refs/heads/main").unwrap();
     let new_git_commit = empty_git_commit(
@@ -2368,12 +2406,13 @@ fn test_fetch_success() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
     // The default bookmark is "main"
     assert_eq!(stats.default_branch, Some("main".to_string()));
     assert!(stats.import_stats.abandoned_commits.is_empty());
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     // The new commit is visible after we fetch again
     let view = repo.view();
     assert!(view.heads().contains(&jj_id(&new_git_commit)));
@@ -2425,6 +2464,7 @@ fn test_fetch_prune_deleted_ref() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
     // Test the setup
@@ -2448,6 +2488,7 @@ fn test_fetch_prune_deleted_ref() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
     assert_eq!(stats.import_stats.abandoned_commits, vec![jj_id(&commit)]);
@@ -2475,6 +2516,7 @@ fn test_fetch_no_default_branch() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
 
@@ -2498,6 +2540,7 @@ fn test_fetch_no_default_branch() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
     // There is no default bookmark
@@ -2519,6 +2562,7 @@ fn test_fetch_empty_refspecs() {
         &[],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     )
     .unwrap();
     assert!(tx
@@ -2545,6 +2589,7 @@ fn test_fetch_no_such_remote() {
         &[StringPattern::everything()],
         git::RemoteCallbacks::default(),
         &git_settings,
+        None,
     );
     assert!(matches!(result, Err(GitFetchError::NoSuchRemote(_))));
 }
@@ -2631,7 +2676,7 @@ fn set_up_push_repos(settings: &UserSettings, temp_dir: &TempDir) -> PushTestSet
             state: RemoteRefState::Tracking,
         },
     );
-    let jj_repo = tx.commit("test");
+    let jj_repo = tx.commit("test").unwrap();
     PushTestSetup {
         source_repo_dir,
         jj_repo,
@@ -2701,7 +2746,7 @@ fn test_push_bookmarks_success() {
     );
 
     // Check that the repo view reflects the changes in the Git repo
-    setup.jj_repo = tx.commit("test");
+    setup.jj_repo = tx.commit("test").unwrap();
     let mut tx = setup.jj_repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &GitSettings::default()).unwrap();
     assert!(!tx.repo_mut().has_changes());
@@ -2753,7 +2798,7 @@ fn test_push_bookmarks_deletion() {
     assert!(view.get_remote_bookmark("main", "origin").is_absent());
 
     // Check that the repo view reflects the changes in the Git repo
-    setup.jj_repo = tx.commit("test");
+    setup.jj_repo = tx.commit("test").unwrap();
     let mut tx = setup.jj_repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &GitSettings::default()).unwrap();
     assert!(!tx.repo_mut().has_changes());
@@ -2822,7 +2867,7 @@ fn test_push_bookmarks_mixed_deletion_and_addition() {
     );
 
     // Check that the repo view reflects the changes in the Git repo
-    setup.jj_repo = tx.commit("test");
+    setup.jj_repo = tx.commit("test").unwrap();
     let mut tx = setup.jj_repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &GitSettings::default()).unwrap();
     assert!(!tx.repo_mut().has_changes());
@@ -3131,7 +3176,7 @@ fn test_bulk_update_extra_on_import_refs() {
         let mut tx = repo.start_transaction(&settings);
         git::import_refs(tx.repo_mut(), &git_settings).unwrap();
         tx.repo_mut().rebase_descendants(&settings).unwrap();
-        tx.commit("test")
+        tx.commit("test").unwrap()
     };
 
     // Extra metadata table shouldn't be created per read_commit() call. The number
@@ -3170,7 +3215,7 @@ fn test_rewrite_imported_commit() {
     let mut tx = repo.start_transaction(&settings);
     git::import_refs(tx.repo_mut(), &git_settings).unwrap();
     tx.repo_mut().rebase_descendants(&settings).unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
     let imported_commit = repo.store().get_commit(&jj_id(&git_commit)).unwrap();
 
     // Try to create identical commit with different change id.
@@ -3187,7 +3232,7 @@ fn test_rewrite_imported_commit() {
         .set_description(imported_commit.description())
         .write()
         .unwrap();
-    let repo = tx.commit("test");
+    let repo = tx.commit("test").unwrap();
 
     // Imported commit shouldn't be reused, and the timestamp of the authored
     // commit should be adjusted to create new commit.
@@ -3212,6 +3257,7 @@ fn test_rewrite_imported_commit() {
 fn test_concurrent_write_commit() {
     let settings = &testutils::user_settings();
     let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let test_env = &test_repo.env;
     let repo = &test_repo.repo;
 
     // Try to create identical commits with different change ids. Timestamp of the
@@ -3221,7 +3267,7 @@ fn test_concurrent_write_commit() {
     thread::scope(|s| {
         let barrier = Arc::new(Barrier::new(num_thread));
         for i in 0..num_thread {
-            let repo = load_repo_at_head(settings, test_repo.repo_path()); // unshare loader
+            let repo = test_env.load_repo_at_head(settings, test_repo.repo_path()); // unshare loader
             let barrier = barrier.clone();
             let sender = sender.clone();
             s.spawn(move || {
@@ -3231,7 +3277,7 @@ fn test_concurrent_write_commit() {
                     .set_description("racy commit")
                     .write()
                     .unwrap();
-                tx.commit(format!("writer {i}"));
+                tx.commit(format!("writer {i}")).unwrap();
                 sender
                     .send((commit.id().clone(), commit.change_id().clone()))
                     .unwrap();
@@ -3274,6 +3320,7 @@ fn test_concurrent_write_commit() {
 fn test_concurrent_read_write_commit() {
     let settings = &testutils::user_settings();
     let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let test_env = &test_repo.env;
     let repo = &test_repo.repo;
 
     // Create unique commits and load them concurrently. In this test, we assume
@@ -3307,7 +3354,7 @@ fn test_concurrent_read_write_commit() {
 
         // Writer assigns random change id
         for (i, commit_id) in commit_ids.iter().enumerate() {
-            let repo = load_repo_at_head(settings, test_repo.repo_path()); // unshare loader
+            let repo = test_env.load_repo_at_head(settings, test_repo.repo_path()); // unshare loader
             let barrier = barrier.clone();
             s.spawn(move || {
                 barrier.wait();
@@ -3316,14 +3363,14 @@ fn test_concurrent_read_write_commit() {
                     .set_description(format!("commit {i}"))
                     .write()
                     .unwrap();
-                tx.commit(format!("writer {i}"));
+                tx.commit(format!("writer {i}")).unwrap();
                 assert_eq!(commit.id(), commit_id);
             });
         }
 
         // Reader may generate change id (if not yet assigned by the writer)
         for i in 0..num_reader_thread {
-            let mut repo = load_repo_at_head(settings, test_repo.repo_path()); // unshare loader
+            let mut repo = test_env.load_repo_at_head(settings, test_repo.repo_path()); // unshare loader
             let barrier = barrier.clone();
             let mut pending_commit_ids = commit_ids.clone();
             pending_commit_ids.rotate_left(i); // start lookup from different place
@@ -3364,7 +3411,7 @@ fn test_concurrent_read_write_commit() {
                         })
                         .collect_vec();
                     if tx.repo_mut().has_changes() {
-                        tx.commit(format!("reader {i}"));
+                        tx.commit(format!("reader {i}")).unwrap();
                     }
                     thread::yield_now();
                 }
@@ -3467,4 +3514,100 @@ ignoreThisSection = foo
     };
 
     assert_eq!(result, expected);
+}
+
+#[test]
+fn test_shallow_commits_lack_parents() {
+    let settings = testutils::user_settings();
+    let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let test_env = &test_repo.env;
+    let repo = &test_repo.repo;
+    let git_repo = get_git_repo(repo);
+
+    // D   E (`main`)
+    // |   |
+    // B   C // shallow boundary
+    // | /
+    // A
+    // |
+    // git_root
+    let git_root = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+
+    let a = empty_git_commit(&git_repo, "refs/heads/main", &[&git_root]);
+
+    let b = empty_git_commit(&git_repo, "refs/heads/feature", &[&a]);
+    let c = empty_git_commit(&git_repo, "refs/heads/main", &[&a]);
+
+    let d = empty_git_commit(&git_repo, "refs/heads/feature", &[&b]);
+    let e = empty_git_commit(&git_repo, "refs/heads/main", &[&c]);
+
+    git_repo.set_head("refs/heads/main").unwrap();
+
+    let make_shallow = |repo, mut shallow_commits: Vec<_>| {
+        let shallow_file = get_git_backend(repo).git_repo().shallow_file();
+        shallow_commits.sort();
+        let mut buf = Vec::<u8>::new();
+        for commit in shallow_commits {
+            writeln!(buf, "{commit}").unwrap();
+        }
+        fs::write(shallow_file, buf).unwrap();
+        // Reload the repo to invalidate mtime-based in-memory cache
+        test_env.load_repo_at_head(&settings, test_repo.repo_path())
+    };
+    let repo = make_shallow(repo, vec![b.id(), c.id()]);
+
+    let mut tx = repo.start_transaction(&settings);
+    git::import_refs(tx.repo_mut(), &GitSettings::default()).unwrap();
+    let repo = tx.commit("import").unwrap();
+    let store = repo.store();
+    let root = store.root_commit_id();
+
+    let expected_heads = hashset! {
+        jj_id(&d),
+        jj_id(&e),
+    };
+    assert_eq!(*repo.view().heads(), expected_heads);
+
+    let parents = |store: &Arc<jj_lib::store::Store>, commit| {
+        let commit = store.get_commit(&jj_id(commit)).unwrap();
+        commit.parent_ids().to_vec()
+    };
+
+    assert_eq!(
+        parents(store, &b),
+        vec![root.clone()],
+        "shallow commits have the root commit as a parent"
+    );
+    assert_eq!(
+        parents(store, &c),
+        vec![root.clone()],
+        "shallow commits have the root commit as a parent"
+    );
+
+    // deepen the shallow clone
+    let repo = make_shallow(&repo, vec![a.id()]);
+
+    let mut tx = repo.start_transaction(&settings);
+    git::import_refs(tx.repo_mut(), &GitSettings::default()).unwrap();
+    let repo = tx.commit("import").unwrap();
+    let store = repo.store();
+    let root = store.root_commit_id();
+
+    assert_eq!(
+        parents(store, &a),
+        vec![root.clone()],
+        "shallow commits have the root commit as a parent"
+    );
+    assert_eq!(
+        parents(store, &b),
+        vec![jj_id(&a)],
+        "unshallowed commits have parents"
+    );
+    assert_eq!(
+        parents(store, &c),
+        vec![jj_id(&a)],
+        "unshallowed commits have correct parents"
+    );
+    // FIXME: new ancestors should be indexed
+    assert!(!repo.index().has_id(&jj_id(&a)));
 }

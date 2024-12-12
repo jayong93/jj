@@ -18,7 +18,10 @@ a comparison with Git, including how workflows are different, see the
 * **Configuration: Partial.** The only configuration from Git (e.g. in
   `~/.gitconfig`) that's respected is the following. Feel free to file a bug if
   you miss any particular configuration options.
-  * The configuration of remotes (`[remote "<name>"]`).
+  * The configuration of remotes (`[remote "<name>"]`). Only the names and URLs
+    are respected (refspecs are not respected, and
+    [only the last pushurl](https://github.com/martinvonz/jj/issues/4889) is
+    respected).
   * `core.excludesFile`
 * **Authentication: Partial.** Only `ssh-agent`, a password-less key (
   only `~/.ssh/id_rsa`, `~/.ssh/id_ed25519` or `~/.ssh/id_ed25519_sk`), or
@@ -57,8 +60,9 @@ a comparison with Git, including how workflows are different, see the
   not be lost either.
 * **Partial clones: No.** We use the [libgit2](https://libgit2.org/) library,
   which [doesn't have support for partial clones](https://github.com/libgit2/libgit2/issues/5564).
-* **Shallow clones: No.** We use the [libgit2](https://libgit2.org/) library,
-  which [doesn't have support for shallow clones](https://github.com/libgit2/libgit2/issues/3058).
+* **Shallow clones: Kind of.** Shallow commits all have the virtual root commit as
+  their parent. However, deepening or fully unshallowing a repository is currently not yet
+  supported and will cause issues.
 * **git-worktree: No.** However, there's native support for multiple working
   copies backed by a single repo. See the `jj workspace` family of commands.
 * **Sparse checkouts: No.** However, there's native support for sparse
@@ -170,15 +174,16 @@ technically possible (though not officially supported) to convert it into a
 co-located repo like so:
 
 ```bash
+# Ignore the .jj directory in Git
+echo '/*' > .jj/.gitignore
 # Move the Git repo
 mv .jj/repo/store/git .git
 # Tell jj where to find it
 echo -n '../../../.git' > .jj/repo/store/git_target
-# Ignore the .jj directory in Git
-echo '/*' > .jj/.gitignore
 # Make the Git repository non-bare and set HEAD
 git config --unset core.bare
-jj new @-
+# Convince jj to update .git/HEAD to point to the working-copy commit's parent
+jj new && jj undo
 ```
 
 We may officially support this in the future. If you try this, we would
